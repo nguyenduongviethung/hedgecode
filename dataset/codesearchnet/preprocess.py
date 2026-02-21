@@ -1,49 +1,76 @@
+import argparse
 import json
 import os
+from datasets import load_dataset
 
-for language in ['ruby','go','java','javascript','php','python']:
-# for language in ['go','javascript','php']:  # 仅使用java数据集
-    print(language)
-    train, valid, test, codebase = [], [], [], []
-    for root, dirs, files in os.walk(language + '/final'):
-        for file in files:
-            temp = os.path.join(root, file)
-            if '.jsonl' in temp:
-                if 'train' in temp:
-                    train.append(temp)
-                elif 'valid' in temp:
-                    valid.append(temp)
-                    codebase.append(temp)
-                elif 'test' in temp:
-                    test.append(temp)
-                    codebase.append(temp)
+ALL_LANGUAGES = ["python", "java", "go", "javascript", "php", "ruby"]
 
-    train_data, valid_data, test_data, codebase_data = {}, {}, {}, {}
-    for files, data in [[train, train_data], [valid, valid_data], [test, test_data], [codebase, codebase_data]]:
-        for file in files:
-            if '.gz' in file:
-                os.system("gzip -d {}".format(file))
-                file = file.replace('.gz', '')
-            with open(file) as f:
-                for line in f:
-                    line = line.strip()
-                    js = json.loads(line)
-                    data[js['url']] = js
+def convert_sample(sample):
+    return {
+        "url": sample["func_code_url"],
+        "code": sample["func_code_string"],
+        "code_tokens": sample["func_code_tokens"],
+        "docstring": sample["func_documentation_string"],
+        "docstring_tokens": sample["func_documentation_tokens"],
+        "original_string": sample["func_code_string"],
+    }
 
-    with open('{}/codebase.jsonl'.format(language), 'w') as f3:
-        for tag, data in [['train', train_data], ['valid', valid_data], ['test', test_data], ['test', test_data],
-                          ['codebase', codebase_data]]:
-            with open('{}/{}.jsonl'.format(language, tag), 'w') as f1, open("{}/{}.txt".format(language, tag)) as f2:
-                for line in f2:
-                    line = line.strip()
-                    if line in data:
-                        js = data[line]
-                        if tag in ['valid', 'test']:
-                            js['original_string'] = ''
-                            js['code'] = ''
-                            js['code_tokens'] = []
-                        if tag == 'codebase':
-                            js['docstring'] = ''
-                            js['docstring_tokens'] = []
-                        f1.write(json.dumps(js) + '\n')
+def process_language(lang):
+    print("Processing", lang)
 
+    ds = load_dataset("code_search_net", lang, trust_remote_code=True)
+
+    os.makedirs(lang, exist_ok=True)
+
+    with open(f"{lang}/train.jsonl", "w") as train_file, \
+         open(f"{lang}/valid.jsonl", "w") as valid_file, \
+         open(f"{lang}/test.jsonl", "w") as test_file, \
+         open(f"{lang}/codebase.jsonl", "w") as codebase_file:
+
+        # ---------- train ----------
+        for sample in ds["train"]:
+            js = convert_sample(sample)
+            train_file.write(json.dumps(js) + "\n")
+
+        # ---------- valid ----------
+        for sample in ds["validation"]:
+            js = convert_sample(sample)
+            js["code"] = ""
+            js["code_tokens"] = []
+            js["original_string"] = ""
+            valid_file.write(json.dumps(js) + "\n")
+
+            cb = convert_sample(sample)
+            cb["docstring"] = ""
+            cb["docstring_tokens"] = []
+            codebase_file.write(json.dumps(cb) + "\n")
+
+        # ---------- test ----------
+        for sample in ds["test"]:
+            js = convert_sample(sample)
+            js["code"] = ""
+            js["code_tokens"] = []
+            js["original_string"] = ""
+            test_file.write(json.dumps(js) + "\n")
+
+            cb = convert_sample(sample)
+            cb["docstring"] = ""
+            cb["docstring_tokens"] = []
+            codebase_file.write(json.dumps(cb) + "\n")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--language", type=str, default="all",
+                        help="Language to preprocess")
+
+    args = parser.parse_args()
+
+    if args.language == "all":
+        languages = ALL_LANGUAGES
+    else:
+        languages = [args.language]
+
+    for lang in languages:
+        process_language(lang)
+
+    print("Done.")

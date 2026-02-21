@@ -1,64 +1,92 @@
 import json
 import os
-
+import argparse
 import torch
 
-if __name__ == '__main__':
 
-    languages = ["ruby", "javascript", "php", "go", "java", "python"]
-    for lang in languages:
-        saved_dir = f"../detection dataset/{lang}"
-        print(f"saved idr: {saved_dir}")
-        dataset_arr = ["test", "train", "valid"]
-        topK = 2
+def process(lang, dataset, args):
 
-        for dataset in dataset_arr:
-            print("**************************************************************************")
-            dataset_file_name = f"../detection dataset/{lang}/{dataset}/{dataset}_top{topK}.jsonl"
-            print(f"dataset file: {dataset_file_name}")
-            pos_pairs = []
-            neg_pairs = []
-            sep_token = ' [SEP] '
+    print("==============================================")
+    print(f"processing: {lang} / {dataset}")
 
-            with open(dataset_file_name, 'r', encoding="utf-8") as q_f:
+    dataset_file_name = f"../detection dataset/{lang}/{dataset}/{dataset}_top{args.topk}.jsonl"
+    print(f"dataset file: {dataset_file_name}")
 
-                for line in q_f:
-                    filter_data = {}
-                    json_obj = json.loads(line)
-                    description = json_obj["code_pos_doc"]
-                    pos_code = json_obj["code_pos"]
-                    neg_code_1 = json_obj["code_neg_1"]
-                    neg_code_2 = json_obj["code_neg_2"]
-                    # neg_code_3 = json_obj["code_neg_3"]
+    pos_pairs = []
+    neg_pairs = []
 
-                    pos_pair = description + sep_token + pos_code
-                    neg_pair_1 = description + sep_token + neg_code_1
-                    neg_pair_2 = description + sep_token + neg_code_2
-                    # neg_pair_3 = pos_token + neg_token + description + sep_token + neg_code_3
+    sep_token = args.sep_token
 
-                    pos_pairs.append(pos_pair)
-                    neg_pairs.append(neg_pair_1)
-                    neg_pairs.append(neg_pair_2)
-                    # neg_pairs.append(neg_pair_3)
+    with open(dataset_file_name, 'r', encoding="utf-8") as f:
 
-            print(f"number of pos pairs dataset: {len(pos_pairs)}")
-            print(f"number of neg pairs dataset: {len(neg_pairs)}")
+        for line in f:
 
-            pos_labels = [1]*len(pos_pairs)
-            neg_labels = [0]*len(neg_pairs)
+            json_obj = json.loads(line)
 
-            datadict = {}
+            description = json_obj["code_pos_doc"]
+            pos_code = json_obj["code_pos"]
 
-            datadict['pos_pairs'] = pos_pairs
-            datadict['neg_pairs'] = neg_pairs
-            datadict['pos_labels'] = pos_labels
-            datadict['neg_labels'] = neg_labels
+            # negative candidates
+            for k in range(1, args.topk + 1):
 
-            print(f"pair dataset length: {str(len(pos_pairs) + len(neg_pairs))}")
+                neg_key = f"code_neg_{k}"
 
-            saved_pair_dir = f"../detection dataset/{lang}/{dataset}"
-            if not os.path.exists(saved_pair_dir):
-                os.makedirs(saved_pair_dir)
+                # backward compatibility
+                if neg_key not in json_obj:
+                    neg_key = f"NO.{k}"
 
-            torch.save(datadict, f"{saved_pair_dir}/{dataset}.h5")
-            print(f"saved file: {saved_pair_dir}/{dataset}.h5")
+                neg_code = json_obj[neg_key]
+
+                neg_pair = description + sep_token + neg_code
+                neg_pairs.append(neg_pair)
+
+            pos_pair = description + sep_token + pos_code
+            pos_pairs.append(pos_pair)
+
+    print(f"number of pos pairs: {len(pos_pairs)}")
+    print(f"number of neg pairs: {len(neg_pairs)}")
+
+    pos_labels = [1] * len(pos_pairs)
+    neg_labels = [0] * len(neg_pairs)
+
+    datadict = {
+        "pos_pairs": pos_pairs,
+        "neg_pairs": neg_pairs,
+        "pos_labels": pos_labels,
+        "neg_labels": neg_labels
+    }
+
+    print(f"total pairs: {len(pos_pairs) + len(neg_pairs)}")
+
+    saved_pair_dir = f"../detection dataset/{lang}/{dataset}"
+    os.makedirs(saved_pair_dir, exist_ok=True)
+
+    save_path = f"{saved_pair_dir}/{dataset}.h5"
+
+    torch.save(datadict, save_path)
+
+    print(f"saved: {save_path}")
+    print("done")
+    print("==============================================")
+
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--language", default="all")
+    parser.add_argument("--dataset", default="all")
+    parser.add_argument("--topk", type=int, default=2)
+    parser.add_argument("--sep_token", default=" [SEP] ")
+
+    args = parser.parse_args()
+
+    ALL_LANGS = ["ruby", "javascript", "php", "go", "java", "python"]
+    ALL_DATASETS = ["train", "valid", "test"]
+
+    langs = ALL_LANGS if args.language == "all" else [args.language]
+    datasets = ALL_DATASETS if args.dataset == "all" else [args.dataset]
+
+    for lang in langs:
+        for ds in datasets:
+            process(lang, ds, args)
