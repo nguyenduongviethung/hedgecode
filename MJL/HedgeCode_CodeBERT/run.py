@@ -9,7 +9,8 @@ from torch.utils.data import SubsetRandomSampler
 from model.HCLModel import HCLModel
 from model.MJLModel import MJLModel
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler
-from transformers import (AdamW, get_linear_schedule_with_warmup, RobertaConfig, RobertaModel, RobertaTokenizer)
+from transformers import get_linear_schedule_with_warmup, RobertaConfig, RobertaModel, RobertaTokenizer
+from torch.optim import AdamW
 
 logger = logging.getLogger(__name__)
 
