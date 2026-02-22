@@ -184,7 +184,7 @@ class MJLModel(nn.Module):
                     'gamms': gamms
                 }
                 targets = {
-                    'label': torch.torch.ones(bs).to(torch.int64).to(self.args.device)
+                    'label': torch.ones(bs).to(torch.int64).to(self.args.device)
                 }
                 self._dequeue_and_enqueue(cls_feats)
                 loss_ctrd = hedge_contrastive_loss(fin_outputs, targets)

@@ -131,6 +131,8 @@ def train(args, model, tokenizer):
             code_inputs = batch[0].to(args.device)
             nl_inputs = batch[1].to(args.device)
             loss = model(code_inputs=code_inputs, nl_inputs=nl_inputs)
+            if loss.dim() > 0:
+                loss = loss.mean()
 
             # report loss
             tr_loss += loss.item()
