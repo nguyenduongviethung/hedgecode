@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import random
+import time
 import torch
 import json
 import numpy as np
@@ -12,9 +13,7 @@ from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampl
 from transformers import get_linear_schedule_with_warmup, RobertaConfig, RobertaModel, RobertaTokenizer
 from torch.optim import AdamW
 
-logger = logging.getLogger(__name__)
-
-os.environ['CUDA_VISIBLE_DEVICES'] = '6'
+# os.environ['CUDA_VISIBLE_DEVICES'] = '6'
 
 
 class InputFeatures(object):
@@ -53,7 +52,7 @@ def convert_examples_to_features(js, tokenizer, args):
 
 
 class TextDataset(Dataset):
-    def __init__(self, tokenizer, args, file_path=None):
+    def __init__(self, tokenizer, logger, args, file_path=None):
         self.examples = []
         data = []
         with open(file_path) as f:
@@ -89,10 +88,10 @@ def set_seed(seed=42):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-def train(args, model, tokenizer):
+def train(args, model, logger, tokenizer):
     """ Train the model """
     # get training dataset
-    train_dataset = TextDataset(tokenizer, args, args.train_data_file)
+    train_dataset = TextDataset(tokenizer, logger, args, args.train_data_file)
     train_sampler = RandomSampler(train_dataset)
 
     if args.fewshot:
@@ -150,7 +149,7 @@ def train(args, model, tokenizer):
             scheduler.step()
 
             # evaluate
-        results = evaluate(args, model, tokenizer, args.eval_data_file, eval_when_training=True)
+        results = evaluate(args, model, logger, tokenizer, args.eval_data_file, eval_when_training=True)
         for key, value in results.items():
             logger.info("  %s = %s", key, round(value, 4))
 
@@ -181,12 +180,12 @@ def train(args, model, tokenizer):
             break
 
 
-def evaluate(args, model, tokenizer, file_name, eval_when_training=False):
-    query_dataset = TextDataset(tokenizer, args, file_name)
+def evaluate(args, model, logger, tokenizer, file_name, eval_when_training=False):
+    query_dataset = TextDataset(tokenizer, logger, args, file_name)
     query_sampler = SequentialSampler(query_dataset)
     query_dataloader = DataLoader(query_dataset, sampler=query_sampler, batch_size=args.eval_batch_size, num_workers=4)
 
-    code_dataset = TextDataset(tokenizer, args, args.codebase_file)
+    code_dataset = TextDataset(tokenizer, logger, args, args.codebase_file)
     code_sampler = SequentialSampler(code_dataset)
     code_dataloader = DataLoader(code_dataset, sampler=code_sampler, batch_size=args.eval_batch_size, num_workers=4)
 
@@ -309,9 +308,24 @@ def main():
     # print arguments
     args = parser.parse_args()
 
-    # set log
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-                        datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
+
+    # # set log
+    # logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+    #                     datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
+    current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+    logger = logging.getLogger('train_logger')
+    logger.setLevel(logging.INFO)
+
+    log_file_name = os.path.join(args.output_dir, f"{current_time}.log")
+
+    with open(log_file_name, 'w') as file:
+        pass
+    file_handler = logging.FileHandler(log_file_name)
+    file_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
     # set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.n_gpu = torch.cuda.device_count()
@@ -341,7 +355,7 @@ def main():
 
     # Training
     if args.do_train:
-        train(args, model, tokenizer)
+        train(args, model, logger, tokenizer)
 
     # Evaluation
     results = {}
@@ -350,7 +364,7 @@ def main():
         output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
         model.load_state_dict(torch.load(output_dir), strict=False)
         model.to(args.device)
-        result = evaluate(args, model, tokenizer, args.eval_data_file)
+        result = evaluate(args, model, logger, tokenizer, args.eval_data_file)
         logger.info("***** Eval results *****")
         for key in sorted(result.keys()):
             logger.info("  %s = %s", key, str(round(result[key], 4)))
@@ -360,7 +374,7 @@ def main():
         output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
         model.load_state_dict(torch.load(output_dir), strict=False)
         model.to(args.device)
-        result = evaluate(args, model, tokenizer, args.test_data_file)
+        result = evaluate(args, model, logger, tokenizer, args.test_data_file)
         logger.info("***** Test results *****")
         for key in sorted(result.keys()):
             logger.info("  %s = %s", key, str(round(result[key], 4)))
