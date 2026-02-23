@@ -170,46 +170,49 @@ def validate(model, criterion, device, valid_loader):
     valid_acc = total_acc / len(valid_loader)
     return valid_loss, valid_acc
 
-
 def read_datasets(lang, logger, args):
     dataset_arr = ["test", "train", "valid"]
 
-    train_texts = []
-    test_texts = []
-    valid_texts = []
-    train_labels = []
-    test_labels = []
-    valid_labels = []
+    train_texts, test_texts, valid_texts = [], [], []
+    train_labels, test_labels, valid_labels = [], [], []
 
     for dataset in dataset_arr:
         dataset_file_name = f"{args.detection_dir}/{lang}/{dataset}/{dataset}.h5"
-        dt = torch.load(dataset_file_name)
 
-        posinput = dt['pos_pairs']
-        neginput = dt['neg_pairs']
-        poslabels = dt['pos_labels']
-        neglabels = dt['neg_labels']
+        if not os.path.exists(dataset_file_name):
+            logger.warning(f"{dataset_file_name} NOT FOUND → use empty dataset")
+            texts, labels = [], []
+        else:
+            dt = torch.load(dataset_file_name)
 
-        texts = posinput + neginput
-        labels = poslabels + neglabels
-        _texts = np.array(texts)
-        _labels = np.array(labels)
+            posinput = dt['pos_pairs']
+            neginput = dt['neg_pairs']
+            poslabels = dt['pos_labels']
+            neglabels = dt['neg_labels']
 
-        logger.info(f"{dataset} dataset file path: {dataset_file_name} - length of {dataset} dataset: {len(texts)}")
+            texts = posinput + neginput
+            labels = poslabels + neglabels
 
-        perm = np.random.permutation(len(_texts))
-        texts_shuffled = _texts[perm]
-        labels_shuffled = _labels[perm]
+        if len(texts) == 0:
+            # keep empty
+            _texts = np.array([])
+            _labels = np.array([])
+        else:
+            _texts = np.array(texts)
+            _labels = np.array(labels)
+
+            perm = np.random.permutation(len(_texts))
+            _texts = _texts[perm]
+            _labels = _labels[perm]
+
+        logger.info(f"{dataset} dataset length: {len(_texts)}")
 
         if dataset == "train":
-            train_texts = texts_shuffled
-            train_labels = labels_shuffled
-        if dataset == "test":
-            test_texts = texts_shuffled
-            test_labels = labels_shuffled
-        if dataset == "valid":
-            valid_texts = texts_shuffled
-            valid_labels = labels_shuffled
+            train_texts, train_labels = _texts, _labels
+        elif dataset == "test":
+            test_texts, test_labels = _texts, _labels
+        elif dataset == "valid":
+            valid_texts, valid_labels = _texts, _labels
 
     return train_texts, test_texts, valid_texts, train_labels, test_labels, valid_labels
 
@@ -231,6 +234,10 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", default=4, type=int, help="Batch size.")
     parser.add_argument("--learning_rate", default=1e-5, type=float, help="The initial learning rate for Adam.")
     parser.add_argument("--num_train_epochs", default=1, type=int, help="Total number of training epochs to perform.")
+    parser.add_argument("--do_train", action='store_true',
+                        help="Whether to run training.")
+    parser.add_argument("--do_eval", action='store_true',
+                        help="Whether to run eval on the dev set.")
 
     args = parser.parse_args()
 
@@ -248,23 +255,7 @@ if __name__ == '__main__':
     saved_dir = f"{output_dir}/{lang}/{encoder_name}/{loss_type}"
     if not os.path.exists(saved_dir):
         os.makedirs(saved_dir)
-
-    if encoder_name == 'cocosoda':
-        tokenizer = RobertaTokenizer.from_pretrained("DeepSoftwareAnalytics/CoCoSoDa")
-        encoder = RobertaModel.from_pretrained(f"DeepSoftwareAnalytics/CoCoSoDa")
-    if encoder_name == 'unixcoder':
-        tokenizer = RobertaTokenizer.from_pretrained("microsoft/unixcoder-base")
-        encoder = RobertaModel.from_pretrained(f"microsoft/unixcoder-base")
-    if encoder_name == 'codebert':
-        tokenizer = RobertaTokenizer.from_pretrained("microsoft/codebert-base")
-        encoder = RobertaModel.from_pretrained(f"microsoft/codebert-base")
-
-    special_tokens = {
-        "additional_special_tokens": ['[POS]', '[NEG]']
-    }
-
-    tokenizer.add_special_tokens(special_tokens)
-
+    
     current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
     logger = logging.getLogger('train_logger')
     logger.setLevel(logging.INFO)
@@ -279,54 +270,76 @@ if __name__ == '__main__':
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-
-    train_texts, test_texts, val_texts, train_labels, test_labels, val_labels = read_datasets(lang, logger, args)
-    train_dataset = ContrastiveDataset(train_texts, train_labels, tokenizer)
-    val_dataset = ContrastiveDataset(val_texts, val_labels, tokenizer)
-    test_dataset = ContrastiveDataset(test_texts, test_labels, tokenizer)
+    if encoder_name == 'cocosoda':
+        tokenizer = RobertaTokenizer.from_pretrained("DeepSoftwareAnalytics/CoCoSoDa")
+        encoder = RobertaModel.from_pretrained(f"DeepSoftwareAnalytics/CoCoSoDa")
+    if encoder_name == 'unixcoder':
+        tokenizer = RobertaTokenizer.from_pretrained("microsoft/unixcoder-base")
+        encoder = RobertaModel.from_pretrained(f"microsoft/unixcoder-base")
+    if encoder_name == 'codebert':
+        tokenizer = RobertaTokenizer.from_pretrained("microsoft/codebert-base")
+        encoder = RobertaModel.from_pretrained(f"microsoft/codebert-base")
 
     hyper_parameter = f"hyper-parameter: - lr: {lr}; epochs: {epochs}; batch_size: {batch_size}"
     logger.info(hyper_parameter)
     logger.info(f"encoder_name: {encoder_name}")
     hidden_size = encoder.config.hidden_size
 
-    collate_fn = partial(my_collate, tokenizer=tokenizer, method=None, num_classes=2, args=args)
-    train_loader = data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-    test_loader = data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-
     encoder.train()
     model = HCLModel(encoder, args=args, tokenizer=tokenizer, hidden_size=hidden_size).to(device)
-
+    
     logger.info(f"model structure: ")
     logger.info(f"=======================================================================================")
     logger.info(model)
     logger.info(f"=======================================================================================")
 
-    # training
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05, betas=(0.9, 0.99), eps=1e-8, amsgrad=True)
+    # ALWAYS SAVE INITIAL MODEL
+    save_path = f'./{args.output_dir}/{args.language}/{args.encoder}/{args.loss_type}/detector.pth'
+    torch.save(model.state_dict(), save_path)
+    logger.info("Saved initial detector (no RA training)")
+
+    special_tokens = {
+        "additional_special_tokens": ['[POS]', '[NEG]']
+    }
+
+    tokenizer.add_special_tokens(special_tokens)
+
+    train_texts, test_texts, val_texts, train_labels, test_labels, val_labels = read_datasets(lang, logger, args)
+    train_dataset = ContrastiveDataset(train_texts, train_labels, tokenizer)
+    val_dataset = ContrastiveDataset(val_texts, val_labels, tokenizer)
+    test_dataset = ContrastiveDataset(test_texts, test_labels, tokenizer)
+
+    collate_fn = partial(my_collate, tokenizer=tokenizer, method=None, num_classes=2, args=args)
     criterion = hedgeLoss(alpha, temp, loss_type)
-    train_date = ''.join(str(datetime.now().date()).split("-"))
-    model = train(args, model, train_date, logger, train_loader, optimizer, criterion, device, valid_loader=val_loader)
 
-    # evaluation
-    encoder.eval()
-    model.eval()
-    criterion.eval()
-    total_acc = 0
-    y_true = []
-    y_pred = []
-    with torch.no_grad():
-        for text, label in test_loader:
-            text = text.to(device)
-            label = label.to(device)
+    if args.do_train:
+        # training
+        train_loader = data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+        val_loader = data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05, betas=(0.9, 0.99), eps=1e-8, amsgrad=True)
+        train_date = ''.join(str(datetime.now().date()).split("-"))
+        model = train(args, model, train_date, logger, train_loader, optimizer, criterion, device, valid_loader=val_loader)
 
-            outputs = model(text)
-            logits = outputs['predicts']
-            y_true.append(label)
-            y_pred.append(torch.argmax(logits, -1))
-            total_acc += accuracy_score(torch.argmax(logits, dim=1).tolist(), label.tolist())
+    if args.do_eval:
+        # evaluation
+        test_loader = data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+        encoder.eval()
+        model.eval()
+        criterion.eval()
+        total_acc = 0
+        y_true = []
+        y_pred = []
+        with torch.no_grad():
+            for text, label in test_loader:
+                text = text.to(device)
+                label = label.to(device)
 
-    test_acc = total_acc / len(test_loader)
+                outputs = model(text)
+                logits = outputs['predicts']
+                y_true.append(label)
+                y_pred.append(torch.argmax(logits, -1))
+                total_acc += accuracy_score(torch.argmax(logits, dim=1).tolist(), label.tolist())
 
-    logger.info(f'Test accuracy: {test_acc:.4f}')
+        test_acc = total_acc / len(test_loader)
+
+        logger.info(f'Test accuracy: {test_acc:.4f}')
