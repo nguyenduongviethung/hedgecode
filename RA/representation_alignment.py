@@ -79,10 +79,13 @@ class hedgeLoss(nn.Module):
             return ce_loss
 
     def hedge_loss(self, anchor, positive, negative):
-        sim_pos = torch.sum(anchor * positive, dim=-1) / torch.norm(anchor) / torch.norm(positive)
-        sim_neg = torch.sum(anchor * negative, dim=-1) / torch.norm(anchor) / torch.norm(negative)
-        loss = -torch.mean(torch.log(torch.exp(sim_pos / self.temp) / torch.sum(torch.exp(sim_neg / self.temp), dim=-1)))
-        return loss
+        sim_pos = F.cosine_similarity(anchor, positive, dim=-1)
+        sim_neg = F.cosine_similarity(anchor, negative, dim=-1)
+
+        logits = torch.stack([sim_pos, sim_neg], dim=1) / self.temp
+        labels = torch.zeros(anchor.size(0), dtype=torch.long, device=anchor.device)
+
+        return F.cross_entropy(logits, labels)
 
     def normalize_feats(self, _feats):
         return F.normalize(_feats, dim=-1)
@@ -90,6 +93,12 @@ class hedgeLoss(nn.Module):
 def train(args, model, train_date, logger, train_loader, optimizer, criterion, device, valid_loader):
     best_valid_loss = np.inf
     best_valid_accuracy = 0.0
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+
+    # early stop
+    patience = 10
+    counter = 0
 
     for epoch in range(args.num_train_epochs):
         model.train()
@@ -103,21 +112,26 @@ def train(args, model, train_date, logger, train_loader, optimizer, criterion, d
             targets = {
                 'label': label
             }
-            outputs = model(text)
-            loss = criterion(outputs, targets)
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                outputs = model(text)
+                loss = criterion(outputs, targets)
 
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             logits1 = outputs['predicts']
             total_loss += loss.item()
-            total_acc += accuracy_score(torch.argmax(logits1, dim=1).tolist(), label.tolist())
+            preds = torch.argmax(logits1, dim=1)
+            correct = (preds == label).sum().item()
+            total_acc += correct / label.size(0)
 
             if batch_idx % 500 == 0:
+                batch_acc = (preds == label).float().mean().item()
                 logger.info(
-                    f'Epoch {epoch} - Batch {batch_idx}/{len(train_loader)} - Loss: {loss.item():.4f} - Train Accuracy: {accuracy_score(torch.argmax(logits1, dim=1).tolist(), label.tolist()):.4f}')
+                    f'Epoch {epoch} - Batch {batch_idx}/{len(train_loader)} - Loss: {loss.item():.4f} - Train Accuracy: {batch_acc:.4f}')
                 print(
-                    f'Epoch {epoch} - Batch {batch_idx}/{len(train_loader)} - Loss: {loss.item():.4f} - Train Accuracy: {accuracy_score(torch.argmax(logits1, dim=1).tolist(), label.tolist()):.4f}')
+                    f'Epoch {epoch} - Batch {batch_idx}/{len(train_loader)} - Loss: {loss.item():.4f} - Train Accuracy: {batch_acc:.4f}')
 
         train_loss = total_loss / len(train_loader)
         train_acc = total_acc / len(train_loader)
@@ -127,9 +141,6 @@ def train(args, model, train_date, logger, train_loader, optimizer, criterion, d
             valid_loss, valid_acc = validate(model, criterion, device, valid_loader)
             logger.info(f'Epoch {epoch} - Valid loss: {valid_loss:.4f} - Valid accuracy: {valid_acc:.4f}')
 
-        # early stop
-        patience = 10
-        counter = 0
         if valid_loss <= best_valid_loss:
             logger.info(f'best valid loss has improved ({best_valid_loss}---->{valid_loss})')
             best_valid_loss = valid_loss
@@ -137,6 +148,7 @@ def train(args, model, train_date, logger, train_loader, optimizer, criterion, d
             best_model_state = copy.deepcopy(model.state_dict())
             torch.save(best_model_state, f'./{args.output_dir}/{args.language}/{args.encoder}/{args.loss_type}/detector.pth')
             logger.info('A new best model state  has saved')
+            counter = 0
         else:
             counter += 1
         if counter >= patience:
@@ -165,7 +177,9 @@ def validate(model, criterion, device, valid_loader):
             loss = criterion(outputs, targets)
             logits = outputs['predicts']
             total_loss += loss.item()
-            total_acc += accuracy_score(torch.argmax(logits, dim=1).tolist(), label.tolist())
+            preds = torch.argmax(logits, dim=1)
+            correct = (preds == label).sum().item()
+            total_acc += correct / label.size(0)
     valid_loss = total_loss / len(valid_loader)
     valid_acc = total_acc / len(valid_loader)
     return valid_loss, valid_acc
@@ -217,6 +231,9 @@ def read_datasets(lang, logger, args):
     return train_texts, test_texts, valid_texts, train_labels, test_labels, valid_labels
 
 if __name__ == '__main__':
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     parser = argparse.ArgumentParser()
 
@@ -287,6 +304,12 @@ if __name__ == '__main__':
 
     encoder.train()
     model = HCLModel(encoder, args=args, tokenizer=tokenizer, hidden_size=hidden_size).to(device)
+
+    for name, param in model.encoder.named_parameters():
+        if "encoder.layer.10" in name or "encoder.layer.11" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
     
     logger.info(f"model structure: ")
     logger.info(f"=======================================================================================")
@@ -314,8 +337,8 @@ if __name__ == '__main__':
 
     if args.do_train:
         # training
-        train_loader = data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-        val_loader = data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+        train_loader = data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True)
+        val_loader = data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True)
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05, betas=(0.9, 0.99), eps=1e-8, amsgrad=True)
         train_date = ''.join(str(datetime.now().date()).split("-"))
         model = train(args, model, train_date, logger, train_loader, optimizer, criterion, device, valid_loader=val_loader)

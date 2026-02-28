@@ -14,22 +14,6 @@ def replace_tokens(inputs, speical_token_ids, tokenizer, mlm_probability):
     inputs[indices_replaced] = speical_token_ids
     return inputs, labels
 
-def augment_data(input_ids, tokenizer, mlm_probability=0.2):
-    random_percent = random.randint(1, 98)
-    _transformations_ids = input_ids.clone()
-    vocab_list = tokenizer.get_vocab()
-    drop_token_ids = [tokenizer.mask_token_id, tokenizer.pad_token_id, tokenizer.cls_token_id,
-                        tokenizer.sep_token_id, tokenizer.unk_token_id, tokenizer.convert_tokens_to_ids('[NEG]'), tokenizer.convert_tokens_to_ids('[POS]')]
-    vocab_list = [token for token in vocab_list.values() if token not in drop_token_ids]
-    if 0 < random_percent < 50:
-        _transformations_ids[:, 5:-2], _ = replace_tokens(input_ids.clone()[:, 5:-2], tokenizer.mask_token_id, tokenizer,
-                                                        mlm_probability)
-    elif 50 <= random_percent < 100:
-        choice_token_id = choice(vocab_list)
-        _transformations_ids[:, 5:-2], _ = replace_tokens(input_ids.clone()[:, 5:-2], choice_token_id, tokenizer,
-                                                        mlm_probability)
-    return _transformations_ids
-
 class HCLModel(nn.Module):
     def __init__(self, encoder, args, tokenizer, hidden_size):
         super(HCLModel, self).__init__()
@@ -45,6 +29,22 @@ class HCLModel(nn.Module):
             self.register_buffer("queue", torch.randn(768, self.K))
             self.queue = nn.functional.normalize(self.queue, dim=0)
             self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
+        drop_token_ids = [
+            tokenizer.mask_token_id,
+            tokenizer.pad_token_id,
+            tokenizer.cls_token_id,
+            tokenizer.sep_token_id,
+            tokenizer.unk_token_id,
+            tokenizer.convert_tokens_to_ids('[NEG]'),
+            tokenizer.convert_tokens_to_ids('[POS]')
+        ]
+
+        vocab = tokenizer.get_vocab()
+        self.vocab_list = [
+            token for token in vocab.values()
+            if token not in drop_token_ids
+        ]
 
     def forward(self, input_ids):
         if self.training:
@@ -93,7 +93,25 @@ class HCLModel(nn.Module):
 
     @torch.no_grad()
     def _data_augment(self, input_ids):
-        return augment_data(input_ids, self.tokenizer, mlm_probability=0.2)
+        random_percent = random.randint(1, 98)
+        _transformations_ids = input_ids.clone()
+
+        if 0 < random_percent < 50:
+            _transformations_ids[:, 5:-2], _ = replace_tokens(
+                input_ids.clone()[:, 5:-2],
+                self.tokenizer.mask_token_id,
+                self.tokenizer,
+                mlm_probability=0.2
+            )
+        else:
+            choice_token_id = random.choice(self.vocab_list)
+            _transformations_ids[:, 5:-2], _ = replace_tokens(
+                input_ids.clone()[:, 5:-2],
+                choice_token_id,
+                self.tokenizer,
+                mlm_probability=0.2
+            )
+        return _transformations_ids
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, _vec):
