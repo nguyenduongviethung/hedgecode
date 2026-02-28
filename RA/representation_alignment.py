@@ -10,8 +10,6 @@ from transformers import RobertaTokenizer, RobertaModel
 import os
 from torch.utils.data import Dataset
 from functools import partial
-from sklearn.metrics import accuracy_score
-import copy
 import logging
 import time
 import argparse
@@ -57,9 +55,10 @@ class hedgeLoss(nn.Module):
         self.alpha = alpha
         self.temp = temp
         self.margin = 1.0
+        self.loss_type = loss_type
 
     def forward(self, outputs, targets):
-        if self.training and loss_type == 'hcl':
+        if self.training and self.loss_type == 'hcl':
             anchor_cls_feats = self.normalize_feats(outputs['cls_feats'])
             anchor_label_feats = self.normalize_feats(outputs['label_feats'])
             neg_cls_feats = self.normalize_feats(outputs['neg_cls_feats'])
@@ -90,21 +89,16 @@ class hedgeLoss(nn.Module):
     def normalize_feats(self, _feats):
         return F.normalize(_feats, dim=-1)
 
-def train(args, model, train_date, logger, train_loader, optimizer, criterion, device, valid_loader):
+def train(args, model, logger, train_loader, optimizer, criterion, device, valid_loader, saved_dir, use_amp=True, scaler=None):
     best_valid_loss = np.inf
     best_valid_accuracy = 0.0
-    use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler(enabled=use_amp)
-
-    # early stop
-    patience = 10
-    counter = 0
-
-    for epoch in range(args.num_train_epochs):
+    total_epochs = args.trained_epochs + args.num_train_epochs
+    for epoch in range(args.trained_epochs, total_epochs):
         model.train()
         criterion.train()
         total_loss = 0
-        total_acc = 0
+        total_correct = 0
+        total_samples = 0
         bar = tqdm(enumerate(train_loader))
         for batch_idx, (text, label) in bar:
             text = text.to(device)
@@ -117,14 +111,19 @@ def train(args, model, train_date, logger, train_loader, optimizer, criterion, d
                 loss = criterion(outputs, targets)
 
             optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             logits1 = outputs['predicts']
             total_loss += loss.item()
             preds = torch.argmax(logits1, dim=1)
             correct = (preds == label).sum().item()
-            total_acc += correct / label.size(0)
+            total_correct += correct
+            total_samples += label.size(0)
 
             if batch_idx % 500 == 0:
                 batch_acc = (preds == label).float().mean().item()
@@ -134,26 +133,26 @@ def train(args, model, train_date, logger, train_loader, optimizer, criterion, d
                     f'Epoch {epoch} - Batch {batch_idx}/{len(train_loader)} - Loss: {loss.item():.4f} - Train Accuracy: {batch_acc:.4f}')
 
         train_loss = total_loss / len(train_loader)
-        train_acc = total_acc / len(train_loader)
+        train_acc = total_correct / total_samples
         logger.info(f'Epoch {epoch} - Train loss: {train_loss:.4f} - Train accuracy: {train_acc:.4f}')
 
         if valid_loader is not None:
             valid_loss, valid_acc = validate(model, criterion, device, valid_loader)
             logger.info(f'Epoch {epoch} - Valid loss: {valid_loss:.4f} - Valid accuracy: {valid_acc:.4f}')
+            if valid_acc > best_valid_accuracy:
+                best_valid_accuracy = valid_acc
+                best_valid_loss = valid_loss
 
-        if valid_loss <= best_valid_loss:
-            logger.info(f'best valid loss has improved ({best_valid_loss}---->{valid_loss})')
-            best_valid_loss = valid_loss
-            best_valid_accuracy = valid_acc
-            best_model_state = copy.deepcopy(model.state_dict())
-            torch.save(best_model_state, f'./{args.output_dir}/{args.language}/{args.encoder}/{args.loss_type}/detector.pth')
-            logger.info('A new best model state  has saved')
-            counter = 0
-        else:
-            counter += 1
-        if counter >= patience:
-            logger.info("Early stopping. No improvement in {} epochs.".format(patience))
-            break
+    checkpoint_path = os.path.join(saved_dir, "detector.pth")
+
+    torch.save({
+        'epoch': total_epochs,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scaler_state_dict': scaler.state_dict() if scaler is not None else None,
+    }, checkpoint_path)
+
+    logger.info(f"Checkpoint saved at epoch {total_epochs}")
 
     logger.info('Training Finish !!!!!!!!')
     logger.info(f'best valid loss == {best_valid_loss}, best valid accuracy == {best_valid_accuracy}')
@@ -165,7 +164,8 @@ def validate(model, criterion, device, valid_loader):
     model.eval()
     criterion.eval()
     total_loss = 0
-    total_acc = 0
+    total_correct = 0
+    total_samples = 0
     with torch.no_grad():
         for text, label in valid_loader:
             text = text.to(device)
@@ -179,9 +179,10 @@ def validate(model, criterion, device, valid_loader):
             total_loss += loss.item()
             preds = torch.argmax(logits, dim=1)
             correct = (preds == label).sum().item()
-            total_acc += correct / label.size(0)
+            total_correct += correct
+            total_samples += label.size(0)
     valid_loss = total_loss / len(valid_loader)
-    valid_acc = total_acc / len(valid_loader)
+    valid_acc = total_correct / total_samples
     return valid_loss, valid_acc
 
 def read_datasets(lang, logger, args):
@@ -255,6 +256,8 @@ if __name__ == '__main__':
                         help="Whether to run training.")
     parser.add_argument("--do_eval", action='store_true',
                         help="Whether to run eval on the dev set.")
+    parser.add_argument("--trained_epochs", default=0, type=int,
+                    help="Number of epochs already trained (for resuming).")
 
     args = parser.parse_args()
 
@@ -269,9 +272,12 @@ if __name__ == '__main__':
     alpha = 0.5
     temp = 0.1
 
-    saved_dir = f"{output_dir}/{lang}/{encoder_name}/{loss_type}"
+    total_epochs = args.trained_epochs + args.num_train_epochs
+    base_dir = f"{output_dir}/{lang}/{encoder_name}/{loss_type}"
+    saved_dir = f"{base_dir}/{total_epochs}_epochs"
+
     if not os.path.exists(saved_dir):
-        os.makedirs(saved_dir)
+        os.makedirs(saved_dir, exist_ok=True)
     
     current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
     logger = logging.getLogger('train_logger')
@@ -296,6 +302,11 @@ if __name__ == '__main__':
     if encoder_name == 'codebert':
         tokenizer = RobertaTokenizer.from_pretrained("microsoft/codebert-base")
         encoder = RobertaModel.from_pretrained(f"microsoft/codebert-base")
+    special_tokens = {
+        "additional_special_tokens": ['[POS]', '[NEG]']
+    }
+
+    tokenizer.add_special_tokens(special_tokens)
 
     hyper_parameter = f"hyper-parameter: - lr: {lr}; epochs: {epochs}; batch_size: {batch_size}"
     logger.info(hyper_parameter)
@@ -304,29 +315,44 @@ if __name__ == '__main__':
 
     encoder.train()
     model = HCLModel(encoder, args=args, tokenizer=tokenizer, hidden_size=hidden_size).to(device)
-
     for name, param in model.encoder.named_parameters():
         if "encoder.layer.10" in name or "encoder.layer.11" in name:
             param.requires_grad = True
         else:
             param.requires_grad = False
+    model.encoder.resize_token_embeddings(len(tokenizer))
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05, betas=(0.9, 0.99), eps=1e-8, amsgrad=True)
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+    
+    if args.trained_epochs > 0:
+        prev_dir = f"{base_dir}/{args.trained_epochs}_epochs"
+        prev_ckpt_path = os.path.join(prev_dir, "detector.pth")
+
+        if not os.path.exists(prev_ckpt_path):
+            raise FileNotFoundError(
+                f"Checkpoint not found at {prev_ckpt_path}"
+            )
+
+        logger.info(f"Loading checkpoint from {prev_ckpt_path}")
+        checkpoint = torch.load(prev_ckpt_path, map_location=device)
+
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if scaler is not None and checkpoint['scaler_state_dict'] is not None:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+        logger.info(f"Resumed from epoch {args.trained_epochs} → will train for {epochs} more epochs (total {total_epochs} epochs)")
+    else:
+        logger.info("trained_epochs = 0 → initialize from pretrained encoder.")
     
     logger.info(f"model structure: ")
     logger.info(f"=======================================================================================")
     logger.info(model)
     logger.info(f"=======================================================================================")
 
-    # ALWAYS SAVE INITIAL MODEL
-    save_path = f'./{args.output_dir}/{args.language}/{args.encoder}/{args.loss_type}/detector.pth'
-    torch.save(model.state_dict(), save_path)
-    logger.info("Saved initial detector (no RA training)")
-
-    special_tokens = {
-        "additional_special_tokens": ['[POS]', '[NEG]']
-    }
-
-    tokenizer.add_special_tokens(special_tokens)
-
+    
     train_texts, test_texts, val_texts, train_labels, test_labels, val_labels = read_datasets(lang, logger, args)
     train_dataset = ContrastiveDataset(train_texts, train_labels, tokenizer)
     val_dataset = ContrastiveDataset(val_texts, val_labels, tokenizer)
@@ -339,9 +365,8 @@ if __name__ == '__main__':
         # training
         train_loader = data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True)
         val_loader = data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05, betas=(0.9, 0.99), eps=1e-8, amsgrad=True)
         train_date = ''.join(str(datetime.now().date()).split("-"))
-        model = train(args, model, train_date, logger, train_loader, optimizer, criterion, device, valid_loader=val_loader)
+        model = train(args, model, logger, train_loader, optimizer, criterion, device, valid_loader=val_loader, saved_dir=saved_dir, use_amp=use_amp, scaler=scaler)
 
     if args.do_eval:
         # evaluation
@@ -361,7 +386,9 @@ if __name__ == '__main__':
                 logits = outputs['predicts']
                 y_true.append(label)
                 y_pred.append(torch.argmax(logits, -1))
-                total_acc += accuracy_score(torch.argmax(logits, dim=1).tolist(), label.tolist())
+                preds = torch.argmax(logits, dim=1)
+                correct = (preds == label).sum().item()
+                total_acc += correct / label.size(0)
 
         test_acc = total_acc / len(test_loader)
 
