@@ -129,15 +129,13 @@ def train(args, model, logger, train_loader, optimizer, criterion, device, valid
                 batch_acc = (preds == label).float().mean().item()
                 logger.info(
                     f'Epoch {epoch} - Batch {batch_idx}/{len(train_loader)} - Loss: {loss.item():.4f} - Train Accuracy: {batch_acc:.4f}')
-                print(
-                    f'Epoch {epoch} - Batch {batch_idx}/{len(train_loader)} - Loss: {loss.item():.4f} - Train Accuracy: {batch_acc:.4f}')
 
         train_loss = total_loss / len(train_loader)
         train_acc = total_correct / total_samples
         logger.info(f'Epoch {epoch} - Train loss: {train_loss:.4f} - Train accuracy: {train_acc:.4f}')
 
         if valid_loader is not None:
-            valid_loss, valid_acc = validate(model, criterion, device, valid_loader)
+            valid_loss, valid_acc = validate(model, logger, criterion, device, valid_loader)
             logger.info(f'Epoch {epoch} - Valid loss: {valid_loss:.4f} - Valid accuracy: {valid_acc:.4f}')
             if valid_acc > best_valid_accuracy:
                 best_valid_accuracy = valid_acc
@@ -159,8 +157,8 @@ def train(args, model, logger, train_loader, optimizer, criterion, device, valid
 
     return model
 
-def validate(model, criterion, device, valid_loader):
-    print("________________valid_______________")
+def validate(model, logger, criterion, device, valid_loader):
+    logger.info("________________valid_______________")
     model.eval()
     criterion.eval()
     total_loss = 0
@@ -280,7 +278,7 @@ if __name__ == '__main__':
         os.makedirs(saved_dir, exist_ok=True)
     
     current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
-    logger = logging.getLogger('train_logger')
+    logger = logging.getLogger('RA_logger')
     logger.setLevel(logging.INFO)
 
     log_file_name = os.path.join(saved_dir, f"{current_time}.log")
