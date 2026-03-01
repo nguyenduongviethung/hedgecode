@@ -315,11 +315,6 @@ if __name__ == '__main__':
 
     encoder.train()
     model = HCLModel(encoder, args=args, tokenizer=tokenizer, hidden_size=hidden_size).to(device)
-    for name, param in model.encoder.named_parameters():
-        if "encoder.layer.10" in name or "encoder.layer.11" in name:
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
     model.encoder.resize_token_embeddings(len(tokenizer))
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05, betas=(0.9, 0.99), eps=1e-8, amsgrad=True)

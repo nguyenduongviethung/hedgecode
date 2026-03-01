@@ -64,7 +64,7 @@ class HCLModel(nn.Module):
 
             # Dynamic hard negative sampling
             neg_cls_feats, gamms = self._compute_similar(self.queue, cls_feats)
-            neg_predicts = self.dropout(self.fc(cls_feats))
+            neg_predicts = self.dropout(self.fc(neg_cls_feats))
 
             fin_outputs = {
                 'predicts': predicts,
