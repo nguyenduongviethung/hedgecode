@@ -260,18 +260,11 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    lr = args.learning_rate
-    epochs = args.num_train_epochs
-    batch_size = args.batch_size
-    loss_type = args.loss_type
-    lang = args.language
-    output_dir = args.output_dir
-    encoder_name = args.encoder
     alpha = 0.5
     temp = 0.1
 
     total_epochs = args.trained_epochs + args.num_train_epochs
-    base_dir = f"{output_dir}/{lang}/{encoder_name}/{loss_type}"
+    base_dir = f"{args.output_dir}/{args.language}/{args.encoder}/{args.loss_type}"
     saved_dir = f"{base_dir}/{total_epochs}_epochs"
 
     if not os.path.exists(saved_dir):
@@ -291,13 +284,13 @@ if __name__ == '__main__':
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    if encoder_name == 'cocosoda':
+    if args.encoder == 'cocosoda':
         tokenizer = RobertaTokenizer.from_pretrained("DeepSoftwareAnalytics/CoCoSoDa")
         encoder = RobertaModel.from_pretrained(f"DeepSoftwareAnalytics/CoCoSoDa")
-    if encoder_name == 'unixcoder':
+    if args.encoder == 'unixcoder':
         tokenizer = RobertaTokenizer.from_pretrained("microsoft/unixcoder-base")
         encoder = RobertaModel.from_pretrained(f"microsoft/unixcoder-base")
-    if encoder_name == 'codebert':
+    if args.encoder == 'codebert':
         tokenizer = RobertaTokenizer.from_pretrained("microsoft/codebert-base")
         encoder = RobertaModel.from_pretrained(f"microsoft/codebert-base")
     special_tokens = {
@@ -306,16 +299,16 @@ if __name__ == '__main__':
 
     tokenizer.add_special_tokens(special_tokens)
 
-    hyper_parameter = f"hyper-parameter: - lr: {lr}; epochs: {epochs}; batch_size: {batch_size}"
+    hyper_parameter = f"hyper-parameter: - lr: {args.learning_rate}; epochs: {args.num_train_epochs}; batch_size: {args.batch_size}"
     logger.info(hyper_parameter)
-    logger.info(f"encoder_name: {encoder_name}")
+    logger.info(f"encoder_name: {args.encoder}")
     hidden_size = encoder.config.hidden_size
 
     encoder.train()
     model = HCLModel(encoder, args=args, tokenizer=tokenizer, hidden_size=hidden_size).to(device)
     model.encoder.resize_token_embeddings(len(tokenizer))
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.05, betas=(0.9, 0.99), eps=1e-8, amsgrad=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.05, betas=(0.9, 0.99), eps=1e-8, amsgrad=True)
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=use_amp)
     
@@ -336,7 +329,7 @@ if __name__ == '__main__':
         if scaler is not None and checkpoint['scaler_state_dict'] is not None:
             scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
-        logger.info(f"Resumed from epoch {args.trained_epochs} → will train for {epochs} more epochs (total {total_epochs} epochs)")
+        logger.info(f"Resumed from epoch {args.trained_epochs} → will train for {args.num_train_epochs} more epochs (total {args.trained_epochs + args.num_train_epochs} epochs)")
     else:
         logger.info("trained_epochs = 0 → initialize from pretrained encoder.")
     
@@ -346,24 +339,24 @@ if __name__ == '__main__':
     logger.info(f"=======================================================================================")
 
     
-    train_texts, test_texts, val_texts, train_labels, test_labels, val_labels = read_datasets(lang, logger, args)
+    train_texts, test_texts, val_texts, train_labels, test_labels, val_labels = read_datasets(args.language, logger, args)
     train_dataset = ContrastiveDataset(train_texts, train_labels, tokenizer)
     val_dataset = ContrastiveDataset(val_texts, val_labels, tokenizer)
     test_dataset = ContrastiveDataset(test_texts, test_labels, tokenizer)
 
     collate_fn = partial(my_collate, tokenizer=tokenizer, method=None, num_classes=2, args=args)
-    criterion = hedgeLoss(alpha, temp, loss_type)
+    criterion = hedgeLoss(alpha, temp, args.loss_type)
 
     if args.do_train:
         # training
-        train_loader = data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True)
-        val_loader = data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True)
+        train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True)
+        val_loader = data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True)
         train_date = ''.join(str(datetime.now().date()).split("-"))
         model = train(args, model, logger, train_loader, optimizer, criterion, device, valid_loader=val_loader, saved_dir=saved_dir, use_amp=use_amp, scaler=scaler)
 
     if args.do_eval:
         # evaluation
-        test_loader = data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+        test_loader = data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
         encoder.eval()
         model.eval()
         criterion.eval()
