@@ -13,8 +13,34 @@ from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampl
 from transformers import get_linear_schedule_with_warmup, RobertaConfig, RobertaModel, RobertaTokenizer
 from torch.optim import AdamW
 
-# os.environ['CUDA_VISIBLE_DEVICES'] = '6'
 
+def read_datasets(lang, logger, args):
+    dataset_arr = ["train", "eval", "test", "codebase"]
+
+    train_texts, eval_texts, test_texts, codebase_texts = [], [], [], []
+
+    for dataset in dataset_arr:
+        dataset_file_path = f"{args.dataset_dir}/{lang}/{dataset}.jsonl"
+
+        data = []
+        with open(dataset_file_path) as f:
+            for line in f:
+                line = line.strip()
+                js = json.loads(line)
+                data.append(js)
+        
+        logger.info(f"{dataset} dataset length: {len(data)}")
+
+        if dataset == "train":
+            train_texts = data
+        elif dataset == "eval":
+            eval_texts = data
+        elif dataset == "test":
+            test_texts = data
+        elif dataset == "codebase":
+            codebase_texts = data
+
+    return train_texts, eval_texts, test_texts, codebase_texts
 
 class InputFeatures(object):
     """A single training/test features for a example."""
@@ -32,46 +58,24 @@ class InputFeatures(object):
         self.nl_ids = nl_ids
         self.url = url
 
-
-def convert_examples_to_features(js, tokenizer, args):
-    code = ' '.join(js['code_tokens'])
-    code_tokens = tokenizer.tokenize(code)[:args.code_length - 2]
-    code_tokens = [tokenizer.cls_token] + code_tokens + [tokenizer.sep_token]
-    code_ids = tokenizer.convert_tokens_to_ids(code_tokens)
-    padding_length = args.code_length - len(code_ids)
-    code_ids += [tokenizer.pad_token_id] * padding_length
-
-    nl = ' '.join(js['docstring_tokens'])
-    nl_tokens = tokenizer.tokenize(nl)[:args.nl_length - 2]
-    nl_tokens = [tokenizer.cls_token] + nl_tokens + [tokenizer.sep_token]
-    nl_ids = tokenizer.convert_tokens_to_ids(nl_tokens)
-    padding_length = args.nl_length - len(nl_ids)
-    nl_ids += [tokenizer.pad_token_id] * padding_length
-
-    return InputFeatures(code_tokens, code_ids, nl_tokens, nl_ids, js['url'])
-
-
 class TextDataset(Dataset):
-    def __init__(self, tokenizer, logger, args, file_path=None):
+    def __init__(self, texts, tokenizer, args):
         self.examples = []
-        data = []
-        with open(file_path) as f:
-            for line in f:
-                line = line.strip()
-                js = json.loads(line)
-                data.append(js)
+        for js in texts:
+            code = ' '.join(js['code_tokens'])
+            code_tokens = tokenizer.tokenize(code)[:args.code_length - 2]
+            code_tokens = [tokenizer.cls_token] + code_tokens + [tokenizer.sep_token]
+            code_ids = tokenizer.convert_tokens_to_ids(code_tokens)
+            padding_length = args.code_length - len(code_ids)
+            code_ids += [tokenizer.pad_token_id] * padding_length
 
-        for js in data:
-            self.examples.append(convert_examples_to_features(js, tokenizer, args))
-
-        if 'train' in file_path:
-            for idx, example in enumerate(self.examples[:1]):
-                logger.info("*** Example ***")
-                logger.info("idx: {}".format(idx))
-                logger.info("code_tokens: {}".format([x.replace('\u0120', '_') for x in example.code_tokens]))
-                logger.info("code_ids: {}".format(' '.join(map(str, example.code_ids))))
-                logger.info("nl_tokens: {}".format([x.replace('\u0120', '_') for x in example.nl_tokens]))
-                logger.info("nl_ids: {}".format(' '.join(map(str, example.nl_ids))))
+            nl = ' '.join(js['docstring_tokens'])
+            nl_tokens = tokenizer.tokenize(nl)[:args.nl_length - 2]
+            nl_tokens = [tokenizer.cls_token] + nl_tokens + [tokenizer.sep_token]
+            nl_ids = tokenizer.convert_tokens_to_ids(nl_tokens)
+            padding_length = args.nl_length - len(nl_ids)
+            nl_ids += [tokenizer.pad_token_id] * padding_length
+            self.examples.append(InputFeatures(code_tokens, code_ids, nl_tokens, nl_ids, js['url']))
 
     def __len__(self):
         return len(self.examples)
@@ -82,123 +86,79 @@ class TextDataset(Dataset):
 
 def set_seed(seed=42):
     random.seed(seed)
-    os.environ['PYHTONHASHSEED'] = str(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-def train(args, model, logger, tokenizer):
-    """ Train the model """
-    # get training dataset
-    train_dataset = TextDataset(tokenizer, logger, args, args.train_data_file)
-    train_sampler = RandomSampler(train_dataset)
+def train(args, model, logger, optimizer, eval_dataset, codebase_dataset, train_dataloader, eval_dataloader, codebase_dataloader, saved_dir, use_amp=True, scaler=None):
+    total_epochs = args.trained_epochs + args.num_train_epochs
+    best_mrr = 0.0
 
-    if args.fewshot:
-        logger.info("Doing few-shot training")
-        all_indices = list(range(len(train_dataset)))
-        random_indices = random.sample(all_indices, int(len(train_dataset) * 0.2))
-        train_sampler = SubsetRandomSampler(random_indices)
+    for epoch in range(args.trained_epochs, total_epochs):
+        model.train()
+        total_loss = 0
 
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4)
-
-    # get optimizer and scheduler
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, eps=1e-8)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0,
-                                                num_training_steps=len(train_dataloader) * args.num_train_epochs)
-
-    # multi-gpu training (should be after apex fp16 initialization)
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
-
-    # Train!
-    logger.info("***** Running training *****")
-    logger.info("  Num examples = %d", len(train_dataset))
-    logger.info("  Num Epochs = %d", args.num_train_epochs)
-    logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size // args.n_gpu)
-    logger.info("  Total train batch size  = %d", args.train_batch_size)
-    logger.info("  Total optimization steps = %d", len(train_dataloader) * args.num_train_epochs)
-
-    # model.resize_token_embeddings(len(tokenizer))
-    model.zero_grad()
-
-    model.train()
-    tr_num, tr_loss, best_mrr = 0, 0, 0
-    for idx in range(args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
-            # get inputs
             code_inputs = batch[0].to(args.device)
             nl_inputs = batch[1].to(args.device)
-            loss = model(code_inputs=code_inputs, nl_inputs=nl_inputs)
-            if loss.dim() > 0:
-                loss = loss.mean()
 
-            # report loss
-            tr_loss += loss.item()
-            tr_num += 1
-            if (step + 1) % 100 == 0:
-                logger.info("epoch {} step {} loss {}".format(idx, step + 1, round(tr_loss / tr_num, 5)))
-                tr_loss = 0
-                tr_num = 0
+            with torch.amp.autocast(
+                device_type=args.device.type,
+                enabled=(args.device.type == "cuda")
+            ):
+                loss = model(code_inputs=code_inputs, nl_inputs=nl_inputs)
 
-            # backward
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            optimizer.step()
+                if loss.dim() > 0:
+                    loss = loss.mean()
+
             optimizer.zero_grad()
-            scheduler.step()
 
-            # evaluate
-        results = evaluate(args, model, logger, tokenizer, args.eval_data_file, eval_when_training=True)
-        for key, value in results.items():
-            logger.info("  %s = %s", key, round(value, 4))
+            if args.device.type == "cuda":
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
-        # early stop
-        patience = 10
-        counter = 0
+            total_loss += loss.item()
 
-        # save best model
+            if step % 500 == 0:
+                logger.info(
+                    f"Epoch {epoch} - Step {step}/{len(train_dataloader)} "
+                    f"- Loss: {loss.item():.4f}"
+                )
+
+        logger.info(
+            f"Epoch {epoch} - Train loss: "
+            f"{total_loss / len(train_dataloader):.4f}"
+        )
+
+        results = evaluate(
+            args, model, eval_dataset, codebase_dataset, eval_dataloader, codebase_dataloader,
+            eval_when_training=True
+        )
+
+        logger.info(f"Epoch {epoch} - Eval MRR: {results['eval_mrr']:.4f}")
+
         if results['eval_mrr'] > best_mrr:
             best_mrr = results['eval_mrr']
-            logger.info("  " + "*" * 20)
-            logger.info("  Best mrr:%s", round(best_mrr, 4))
-            logger.info("  " + "*" * 20)
 
-            checkpoint_prefix = 'checkpoint-best-mrr'
-            output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-            model_to_save = model.module if hasattr(model, 'module') else model
-            model_to_save.encoder.save_pretrained(output_dir)
-            output_dir = os.path.join(output_dir, '{}'.format('model.bin'))
-            torch.save(model_to_save.state_dict(), output_dir)
-            logger.info("Saving model checkpoint to %s", output_dir)
-        else:
-            counter += 1
-        if counter >= patience:
-            logger.info("Early stopping. No improvement in {} epochs.".format(patience))
-            break
+    checkpoint_path = os.path.join(saved_dir, "detector.pth")
+
+    torch.save({
+        'epoch': total_epochs,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scaler_state_dict': scaler.state_dict() if scaler else None,
+    }, checkpoint_path)
+
+    logger.info(f"Checkpoint saved at epoch {total_epochs}")
 
 
-def evaluate(args, model, logger, tokenizer, file_name, eval_when_training=False):
-    query_dataset = TextDataset(tokenizer, logger, args, file_name)
-    query_sampler = SequentialSampler(query_dataset)
-    query_dataloader = DataLoader(query_dataset, sampler=query_sampler, batch_size=args.eval_batch_size, num_workers=4)
-
-    code_dataset = TextDataset(tokenizer, logger, args, args.codebase_file)
-    code_sampler = SequentialSampler(code_dataset)
-    code_dataloader = DataLoader(code_dataset, sampler=code_sampler, batch_size=args.eval_batch_size, num_workers=4)
-
-    # multi-gpu evaluate
-    if args.n_gpu > 1 and eval_when_training is False:
-        model = torch.nn.DataParallel(model)
-
-    # Eval!
-    logger.info("***** Running evaluation *****")
-    logger.info("  Num queries = %d", len(query_dataset))
-    logger.info("  Num codes = %d", len(code_dataset))
-    logger.info("  Batch size = %d", args.eval_batch_size)
-
+def evaluate(args, model, query_dataset, code_dataset, query_dataloader, code_dataloader, eval_when_training=False):
     model.eval()
     code_vecs = []
     nl_vecs = []
@@ -213,7 +173,7 @@ def evaluate(args, model, logger, tokenizer, file_name, eval_when_training=False
         with torch.no_grad():
             code_vec = model(code_inputs=code_inputs)
             code_vecs.append(code_vec.cpu().numpy())
-    model.train()
+
     code_vecs = np.concatenate(code_vecs, 0)
     nl_vecs = np.concatenate(nl_vecs, 0)
 
@@ -254,24 +214,13 @@ def main():
     parser = argparse.ArgumentParser()
 
     ## Required parameters
-    parser.add_argument("--train_data_file", default=None, type=str, required=True,
-                        help="The input training data file (a json file).")
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")
-    parser.add_argument("--eval_data_file", default=None, type=str,
-                        help="An optional input evaluation data file to evaluate the MRR(a jsonl file).")
-    parser.add_argument("--test_data_file", default=None, type=str,
-                        help="An optional input test data file to test the MRR(a josnl file).")
-    parser.add_argument("--codebase_file", default=None, type=str,
-                        help="An optional input test data file to codebase (a jsonl file).")
-
-    parser.add_argument("--model_name_or_path", default=None, type=str,
-                        help="The model checkpoint for weights initialization.")
-    parser.add_argument("--config_name", default="", type=str,
-                        help="Optional pretrained config name or path if not the same as model_name_or_path")
-    parser.add_argument("--tokenizer_name", default="", type=str,
-                        help="Optional pretrained tokenizer name or path if not the same as model_name_or_path")
-
+    parser.add_argument("--dataset_dir", default=None, type=str, required=True,
+                        help="The input dataset directory which contains train.jsonl, eval.jsonl, test.jsonl and codebase.jsonl.")
+    parser.add_argument("--detector_dir", type=str, default=None,
+                        help="Directory containing detector.pth")
+    
     parser.add_argument("--nl_length", default=128, type=int,
                         help="Optional NL input sequence length after tokenization.")
     parser.add_argument("--code_length", default=256, type=int,
@@ -284,12 +233,7 @@ def main():
     parser.add_argument("--do_test", action='store_true',
                         help="Whether to run eval on the test set.")
 
-    parser.add_argument("--detector_path", default=None, type=str,
-                        help="The plugin checkpoint path")
-
     parser.add_argument("--fewshot", default=False, action='store_true', required=False, help="do shot setting")
-    parser.add_argument("--without_ctc", default=False, action='store_true', required=False, help="Training with ctc")
-    parser.add_argument("--without_ctrd", default=False, action='store_true', required=False, help="Training with ctrd")
 
     parser.add_argument("--train_batch_size", default=4, type=int,
                         help="Batch size for training.")
@@ -297,27 +241,32 @@ def main():
                         help="Batch size for evaluation.")
     parser.add_argument("--learning_rate", default=5e-5, type=float,
                         help="The initial learning rate for Adam.")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float,
-                        help="Max gradient norm.")
     parser.add_argument("--num_train_epochs", default=1, type=int,
                         help="Total number of training epochs to perform.")
 
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
 
-    # print arguments
+    parser.add_argument("--language", type=str, required=True)
+    parser.add_argument("--encoder", type=str, default="codebert",
+                        choices=["codebert", "unixcoder", "cocosoda"])
+    parser.add_argument("--trained_epochs", default=0, type=int,
+                        help="Number of epochs already trained (for resuming).")
+
+
+    # arguments
     args = parser.parse_args()
 
-
-    # # set log
-    # logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-    #                     datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
+    total_epochs = args.trained_epochs + args.num_train_epochs
+    base_dir = f"{args.output_dir}/{args.language}/{args.encoder}"
+    saved_dir = f"{base_dir}/{total_epochs}_epochs"
+    os.makedirs(saved_dir, exist_ok=True)
+    
     current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
     logger = logging.getLogger('train_logger')
     logger.setLevel(logging.INFO)
 
-    log_file_name = os.path.join(args.output_dir, f"{current_time}.log")
-
+    log_file_name = os.path.join(saved_dir, f"{current_time}.log")
     with open(log_file_name, 'w') as file:
         pass
     file_handler = logging.FileHandler(log_file_name)
@@ -336,45 +285,123 @@ def main():
     set_seed(args.seed)
 
     # build model
-    config = RobertaConfig.from_pretrained(args.config_name if args.config_name else args.model_name_or_path)
-    tokenizer = RobertaTokenizer.from_pretrained(args.tokenizer_name)
-    encoder = RobertaModel.from_pretrained(args.model_name_or_path)
+    if args.encoder == 'cocosoda':
+        tokenizer = RobertaTokenizer.from_pretrained("DeepSoftwareAnalytics/CoCoSoDa")
+        encoder = RobertaModel.from_pretrained("DeepSoftwareAnalytics/CoCoSoDa")
+    if args.encoder == 'unixcoder':
+        tokenizer = RobertaTokenizer.from_pretrained("microsoft/unixcoder-base")
+        encoder = RobertaModel.from_pretrained("microsoft/unixcoder-base")
+    if args.encoder == 'codebert':
+        tokenizer = RobertaTokenizer.from_pretrained("microsoft/codebert-base")
+        encoder = RobertaModel.from_pretrained("microsoft/codebert-base")
 
-    detector_path = args.detector_path
-    if detector_path is not None:
-        logger.info(f"plugin_checkpoint_path : {detector_path}")
-        hidden_size = encoder.config.hidden_size
-        detector = HCLModel(encoder, args, None, hidden_size=hidden_size).to(device)
-        state_dict = torch.load(detector_path)
-        detector.load_state_dict(state_dict, strict=False)
-        encoder = detector.encoder
+    hidden_size = encoder.config.hidden_size
 
-    model = MJLModel(encoder, tokenizer, args)
-    logger.info("Training/evaluation parameters %s", args)
-    model.to(args.device)
+    # ========== BUILD MODEL FIRST ==========
+    if args.trained_epochs > 0:
+
+        prev_dir = f"{base_dir}/{args.trained_epochs}_epochs"
+        prev_ckpt_path = os.path.join(prev_dir, "detector.pth")
+
+        if not os.path.exists(prev_ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found at {prev_ckpt_path}")
+
+        logger.info(f"Loading checkpoint from {prev_ckpt_path}")
+        checkpoint = torch.load(prev_ckpt_path, map_location=args.device)
+
+        model = MJLModel(encoder, tokenizer, args).to(args.device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+
+    else:
+
+        if args.detector_dir is not None:
+            detector_path = os.path.join(args.detector_dir, "detector.pth")
+            logger.info(f"Loading detector from {detector_path}")
+
+            checkpoint = torch.load(detector_path, map_location=args.device)
+
+            detector = HCLModel(
+                encoder,
+                args=args,
+                tokenizer=None,
+                hidden_size=hidden_size
+            ).to(args.device)
+
+            detector.load_state_dict(checkpoint['model_state_dict'], strict=False)
+
+            encoder = detector.encoder
+
+        model = MJLModel(encoder, tokenizer, args).to(args.device)
+
+    # ========== NOW BUILD OPTIMIZER ==========
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=0.05,
+        betas=(0.9, 0.99),
+        eps=1e-8,
+        amsgrad=True
+    )
+
+    use_amp = args.device.type == "cuda"
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+
+    # ========== LOAD OPTIMIZER STATE IF RESUME ==========
+    if args.trained_epochs > 0:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        if scaler is not None and checkpoint['scaler_state_dict'] is not None:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+        logger.info(
+            f"Resumed from epoch {args.trained_epochs} → "
+            f"will train {args.num_train_epochs} more epochs"
+        )
+
+    logger.info(f"model structure: ")
+    logger.info(f"=======================================================================================")
+    logger.info(model)
+    logger.info(f"=======================================================================================")
+
+    train_texts, eval_texts, test_texts, codebase_texts = read_datasets(args.language, logger, args)
+    train_dataset = TextDataset(train_texts, tokenizer, args)
+    eval_dataset = TextDataset(eval_texts, tokenizer, args)
+    test_dataset = TextDataset(test_texts, tokenizer, args)
+    codebase_dataset = TextDataset(codebase_texts, tokenizer, args)
+
+    train_sampler = RandomSampler(train_dataset)
+
+    if args.fewshot:
+        logger.info("Doing few-shot training")
+        all_indices = list(range(len(train_dataset)))
+        random_indices = random.sample(all_indices, int(len(train_dataset) * 0.2))
+        train_sampler = SubsetRandomSampler(random_indices)
+
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4)
+
+    eval_sampler = SequentialSampler(eval_dataset)
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=4)
+
+    test_sampler = SequentialSampler(test_dataset)
+    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.eval_batch_size, num_workers=4)
+
+    codebase_sampler = SequentialSampler(codebase_dataset)
+    codebase_dataloader = DataLoader(codebase_dataset, sampler=codebase_sampler, batch_size=args.eval_batch_size, num_workers=4)
 
     # Training
     if args.do_train:
-        train(args, model, logger, tokenizer)
+        train(args, model, logger, optimizer, eval_dataset, codebase_dataset, train_dataloader, eval_dataloader, codebase_dataloader, saved_dir, use_amp, scaler)
 
     # Evaluation
     results = {}
     if args.do_eval:
-        checkpoint_prefix = 'checkpoint-best-mrr/model.bin'
-        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
-        model.load_state_dict(torch.load(output_dir), strict=False)
-        model.to(args.device)
-        result = evaluate(args, model, logger, tokenizer, args.eval_data_file)
+        result = evaluate(args, model, eval_dataset, codebase_dataset, eval_dataloader, codebase_dataloader)
         logger.info("***** Eval results *****")
         for key in sorted(result.keys()):
             logger.info("  %s = %s", key, str(round(result[key], 4)))
 
     if args.do_test:
-        checkpoint_prefix = 'checkpoint-best-mrr/model.bin'
-        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))
-        model.load_state_dict(torch.load(output_dir), strict=False)
-        model.to(args.device)
-        result = evaluate(args, model, logger, tokenizer, args.test_data_file)
+        result = evaluate(args, model, test_dataset, codebase_dataset, test_dataloader, codebase_dataloader)
         logger.info("***** Test results *****")
         for key in sorted(result.keys()):
             logger.info("  %s = %s", key, str(round(result[key], 4)))
