@@ -323,7 +323,7 @@ def main():
             detector = HCLModel(
                 encoder,
                 args=args,
-                tokenizer=None,
+                tokenizer=tokenizer,
                 hidden_size=hidden_size
             ).to(args.device)
 
