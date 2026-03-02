@@ -294,6 +294,11 @@ def main():
     if args.encoder == 'codebert':
         tokenizer = RobertaTokenizer.from_pretrained("microsoft/codebert-base")
         encoder = RobertaModel.from_pretrained("microsoft/codebert-base")
+    special_tokens = {
+        "additional_special_tokens": ['[POS]', '[NEG]']
+    }
+    tokenizer.add_special_tokens(special_tokens)
+    encoder.resize_token_embeddings(len(tokenizer))
 
     hidden_size = encoder.config.hidden_size
 
