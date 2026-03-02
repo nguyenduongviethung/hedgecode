@@ -121,6 +121,7 @@ def train(args, model, logger, optimizer, valid_dataset, codebase_dataset, train
                 scaler.update()
             else:
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
 
             total_loss += loss.item()
@@ -346,7 +347,7 @@ def main():
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
-        weight_decay=0.05,
+        weight_decay=0.01,
         betas=(0.9, 0.99),
         eps=1e-8,
         amsgrad=True
