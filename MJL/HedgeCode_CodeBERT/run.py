@@ -15,9 +15,9 @@ from torch.optim import AdamW
 
 
 def read_datasets(lang, logger, args):
-    dataset_arr = ["train", "eval", "test", "codebase"]
+    dataset_arr = ["train", "valid", "test", "codebase"]
 
-    train_texts, eval_texts, test_texts, codebase_texts = [], [], [], []
+    train_texts, valid_texts, test_texts, codebase_texts = [], [], [], []
 
     for dataset in dataset_arr:
         dataset_file_path = f"{args.dataset_dir}/{lang}/{dataset}.jsonl"
@@ -33,14 +33,14 @@ def read_datasets(lang, logger, args):
 
         if dataset == "train":
             train_texts = data
-        elif dataset == "eval":
-            eval_texts = data
+        elif dataset == "valid":
+            valid_texts = data
         elif dataset == "test":
             test_texts = data
         elif dataset == "codebase":
             codebase_texts = data
 
-    return train_texts, eval_texts, test_texts, codebase_texts
+    return train_texts, valid_texts, test_texts, codebase_texts
 
 class InputFeatures(object):
     """A single training/test features for a example."""
@@ -92,7 +92,7 @@ def set_seed(seed=42):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-def train(args, model, logger, optimizer, eval_dataset, codebase_dataset, train_dataloader, eval_dataloader, codebase_dataloader, saved_dir, use_amp=True, scaler=None):
+def train(args, model, logger, optimizer, valid_dataset, codebase_dataset, train_dataloader, valid_dataloader, codebase_dataloader, saved_dir, use_amp=True, scaler=None):
     total_epochs = args.trained_epochs + args.num_train_epochs
     best_mrr = 0.0
 
@@ -137,7 +137,7 @@ def train(args, model, logger, optimizer, eval_dataset, codebase_dataset, train_
         )
 
         results = evaluate(
-            args, model, eval_dataset, codebase_dataset, eval_dataloader, codebase_dataloader,
+            args, model, valid_dataset, codebase_dataset, valid_dataloader, codebase_dataloader,
             eval_when_training=True
         )
 
@@ -206,6 +206,8 @@ def evaluate(args, model, query_dataset, code_dataset, query_dataloader, code_da
     result = {
         "eval_mrr": float(np.mean(ranks))
     }
+    if eval_when_training:
+        model.train()
 
     return result
 
@@ -217,7 +219,7 @@ def main():
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")
     parser.add_argument("--dataset_dir", default=None, type=str, required=True,
-                        help="The input dataset directory which contains train.jsonl, eval.jsonl, test.jsonl and codebase.jsonl.")
+                        help="The input dataset directory which contains train.jsonl, valid.jsonl, test.jsonl and codebase.jsonl.")
     parser.add_argument("--detector_dir", type=str, default=None,
                         help="Directory containing detector.pth")
     
@@ -228,8 +230,8 @@ def main():
 
     parser.add_argument("--do_train", action='store_true',
                         help="Whether to run training.")
-    parser.add_argument("--do_eval", action='store_true',
-                        help="Whether to run eval on the dev set.")
+    parser.add_argument("--do_valid", action='store_true',
+                        help="Whether to run eval on the valid set.")
     parser.add_argument("--do_test", action='store_true',
                         help="Whether to run eval on the test set.")
 
@@ -368,9 +370,9 @@ def main():
     logger.info(model)
     logger.info(f"=======================================================================================")
 
-    train_texts, eval_texts, test_texts, codebase_texts = read_datasets(args.language, logger, args)
+    train_texts, valid_texts, test_texts, codebase_texts = read_datasets(args.language, logger, args)
     train_dataset = TextDataset(train_texts, tokenizer, args)
-    eval_dataset = TextDataset(eval_texts, tokenizer, args)
+    valid_dataset = TextDataset(valid_texts, tokenizer, args)
     test_dataset = TextDataset(test_texts, tokenizer, args)
     codebase_dataset = TextDataset(codebase_texts, tokenizer, args)
 
@@ -384,8 +386,8 @@ def main():
 
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4)
 
-    eval_sampler = SequentialSampler(eval_dataset)
-    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=4)
+    valid_sampler = SequentialSampler(valid_dataset)
+    valid_dataloader = DataLoader(valid_dataset, sampler=valid_sampler, batch_size=args.eval_batch_size, num_workers=4)
 
     test_sampler = SequentialSampler(test_dataset)
     test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.eval_batch_size, num_workers=4)
@@ -395,13 +397,13 @@ def main():
 
     # Training
     if args.do_train:
-        train(args, model, logger, optimizer, eval_dataset, codebase_dataset, train_dataloader, eval_dataloader, codebase_dataloader, saved_dir, use_amp, scaler)
+        train(args, model, logger, optimizer, valid_dataset, codebase_dataset, train_dataloader, valid_dataloader, codebase_dataloader, saved_dir, use_amp, scaler)
 
     # Evaluation
     results = {}
-    if args.do_eval:
-        result = evaluate(args, model, eval_dataset, codebase_dataset, eval_dataloader, codebase_dataloader)
-        logger.info("***** Eval results *****")
+    if args.do_valid:
+        result = evaluate(args, model, valid_dataset, codebase_dataset, valid_dataloader, codebase_dataloader)
+        logger.info("***** Valid results *****")
         for key in sorted(result.keys()):
             logger.info("  %s = %s", key, str(round(result[key], 4)))
 
