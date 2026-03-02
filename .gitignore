@@ -1,1 +1,4 @@
 *.jsonl
+dataset-metadata.json
+dataset/detection dataset/*
+**/save_results/
