@@ -236,6 +236,8 @@ def main():
                         help="Whether to run eval on the test set.")
 
     parser.add_argument("--fewshot", default=False, action='store_true', required=False, help="do shot setting")
+    parser.add_argument("--without_ctc", default=False, action='store_true', required=False, help="Training with ctc")
+    parser.add_argument("--without_ctrd", default=False, action='store_true', required=False, help="Training with ctrd")
 
     parser.add_argument("--train_batch_size", default=4, type=int,
                         help="Batch size for training.")
@@ -265,7 +267,7 @@ def main():
     os.makedirs(saved_dir, exist_ok=True)
     
     current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
-    logger = logging.getLogger('train_logger')
+    logger = logging.getLogger('MJL_logger')
     logger.setLevel(logging.INFO)
 
     log_file_name = os.path.join(saved_dir, f"{current_time}.log")
