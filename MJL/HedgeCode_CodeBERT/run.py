@@ -218,6 +218,9 @@ def evaluate(args, model, query_dataset, code_dataset, query_dataloader, code_da
 
 
 def main():
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     parser = argparse.ArgumentParser()
 
     ## Required parameters
@@ -235,13 +238,6 @@ def main():
     parser.add_argument("--code_length", default=256, type=int,
                         help="Optional Code input sequence length after tokenization.")
 
-    parser.add_argument("--do_train", action='store_true',
-                        help="Whether to run training.")
-    parser.add_argument("--do_valid", action='store_true',
-                        help="Whether to run eval on the valid set.")
-    parser.add_argument("--do_test", action='store_true',
-                        help="Whether to run eval on the test set.")
-
     parser.add_argument("--fewshot", default=False, action='store_true', required=False, help="do shot setting")
     parser.add_argument("--without_ctc", default=False, action='store_true', required=False, help="Training with ctc")
     parser.add_argument("--without_ctrd", default=False, action='store_true', required=False, help="Training with ctrd")
@@ -252,8 +248,8 @@ def main():
                         help="Batch size for evaluation.")
     parser.add_argument("--learning_rate", default=5e-5, type=float,
                         help="The initial learning rate for Adam.")
-    parser.add_argument("--num_train_epochs", default=1, type=int,
-                        help="Total number of training epochs to perform.")
+    parser.add_argument("--max_grad_norm", default=1.0, type=float,
+                        help="Max gradient norm.")
 
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
@@ -261,11 +257,16 @@ def main():
     parser.add_argument("--language", type=str, required=True)
     parser.add_argument("--encoder", type=str, default="codebert",
                         choices=["codebert", "unixcoder", "cocosoda"])
+    parser.add_argument('--loss_type', type=str, default='ce', choices=['ce', 'hcl'], help="Loss function type.")
+    
+    parser.add_argument("--total_epochs", default=1, type=int,
+                        help="Total number of training epochs to perform.")
+    parser.add_argument("--num_train_epochs", default=1, type=int,
+                        help="Number of training epochs to perform (for new training or additional epochs for resuming).")
     parser.add_argument("--trained_epochs", default=0, type=int,
                         help="Number of epochs already trained (for resuming).")
     parser.add_argument("--RA_trained_epochs", default=0, type=int,
                         help="Number of epochs already trained for RA (for resuming).")
-    parser.add_argument('--loss_type', type=str, default='ce', choices=['ce', 'hcl'], help="Loss function type.")
 
 
     # arguments
@@ -401,7 +402,7 @@ def main():
     codebase_sampler = SequentialSampler(codebase_dataset)
     codebase_dataloader = DataLoader(codebase_dataset, sampler=codebase_sampler, batch_size=args.eval_batch_size, num_workers=4)
 
-    total_steps = len(train_dataloader) * (args.trained_epochs + args.num_train_epochs)
+    total_steps = len(train_dataloader) * args.total_epochs
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=int(0.1 * total_steps),
@@ -413,25 +414,14 @@ def main():
         scheduler.load_state_dict(checkpoint.get('scheduler_state_dict', {}))
 
     # Training
-    if args.do_train:
+    if args.num_train_epochs > 0:
         train(args, model, logger, optimizer, scheduler, valid_dataset, codebase_dataset, train_dataloader, valid_dataloader, codebase_dataloader, saved_dir, use_amp, scaler)
 
-    # Evaluation
-    results = {}
-    if args.do_valid:
-        result = evaluate(args, model, valid_dataset, codebase_dataset, valid_dataloader, codebase_dataloader)
-        logger.info("***** Valid results *****")
-        for key in sorted(result.keys()):
-            logger.info("  %s = %s", key, str(round(result[key], 4)))
-
-    if args.do_test:
-        result = evaluate(args, model, test_dataset, codebase_dataset, test_dataloader, codebase_dataloader)
-        logger.info("***** Test results *****")
-        for key in sorted(result.keys()):
-            logger.info("  %s = %s", key, str(round(result[key], 4)))
-
-    return results
-
+    # Testing
+    result = evaluate(args, model, test_dataset, codebase_dataset, test_dataloader, codebase_dataloader)
+    logger.info("***** Test results *****")
+    for key in sorted(result.keys()):
+        logger.info("  %s = %s", key, str(round(result[key], 4)))
 
 if __name__ == "__main__":
     main()

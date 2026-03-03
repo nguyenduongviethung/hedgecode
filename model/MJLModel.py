@@ -176,19 +176,15 @@ class MJLModel(nn.Module):
                 pos_outputs = self.encoder(pos_inputs_ids, attention_mask=pos_inputs_ids.ne(self.pad_id)).last_hidden_state  # [B*len*768]
                 pos_cls_feats = pos_outputs[:, 0, :]  # B*768
                 pos_label_feats = pos_outputs[:, 1:self.num_classes + 1, :]  # [B*2*768]
-                pos_predicts = self.dropout(self.fc(pos_cls_feats))
 
                 # Dynamic hard negative sampling
                 neg_cls_feats, gamms = self._compute_similar(self.queue, cls_feats)  # [B*768], [B]
-                neg_predicts = self.dropout(self.fc(neg_cls_feats))  # [B*2]
                 fin_outputs = {
                     'predicts': predicts,
                     'cls_feats': cls_feats,
                     'label_feats': label_feats,
-                    'pos_predicts': pos_predicts,
                     'pos_cls_feats': pos_cls_feats,
                     'pos_label_feats': pos_label_feats,
-                    'neg_predicts': neg_predicts,
                     'neg_cls_feats': neg_cls_feats,
                     'gamms': gamms
                 }
