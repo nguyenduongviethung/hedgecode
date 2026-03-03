@@ -190,7 +190,7 @@ def read_datasets(lang, logger, args):
     train_labels, test_labels, valid_labels = [], [], []
 
     for dataset in dataset_arr:
-        dataset_file_name = f"{args.detection_dir}/{lang}/{dataset}/{dataset}.h5"
+        dataset_file_name = f"{args.dataset_dir}/{lang}/{dataset}/{dataset}.h5"
 
         if not os.path.exists(dataset_file_name):
             logger.warning(f"{dataset_file_name} NOT FOUND → use empty dataset")
@@ -237,23 +237,25 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--language", default=None, type=str, required=True, help="The programming language.")
+    parser.add_argument('--encoder', type=str, default='codebert', choices=['codebert', 'unixcoder', 'cocosoda'])
+    parser.add_argument('--loss_type', type=str, default='ce', choices=['ce', 'hcl'], help="Loss function type.")
+
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")
-    parser.add_argument("--detection_dir", default=None, type=str, required=True,
+    parser.add_argument("--checkpoint_dir", type=str, default=None,
+                        help="Directory containing detector.pth")
+    parser.add_argument("--dataset_dir", default=None, type=str, required=True,
                         help="The folder of detection pair datasets.")
-    parser.add_argument('--encoder', type=str, default='codebert', choices=['codebert', 'unixcoder', 'cocosoda'])
+    
     parser.add_argument("--nl_length", default=128, type=int,
                         help="Optional NL input sequence length after tokenization.")
     parser.add_argument("--code_length", default=256, type=int,
                         help="Optional Code input sequence length after tokenization.")
-    parser.add_argument('--loss_type', type=str, default='ce', choices=['ce', 'hcl'], help="Loss function type.")
+    
     parser.add_argument("--batch_size", default=4, type=int, help="Batch size.")
     parser.add_argument("--learning_rate", default=1e-5, type=float, help="The initial learning rate for Adam.")
+
     parser.add_argument("--num_train_epochs", default=1, type=int, help="Total number of training epochs to perform.")
-    parser.add_argument("--do_train", action='store_true',
-                        help="Whether to run training.")
-    parser.add_argument("--do_eval", action='store_true',
-                        help="Whether to run eval on the dev set.")
     parser.add_argument("--trained_epochs", default=0, type=int,
                     help="Number of epochs already trained (for resuming).")
 
@@ -313,7 +315,7 @@ if __name__ == '__main__':
     scaler = torch.amp.GradScaler(enabled=use_amp)
     
     if args.trained_epochs > 0:
-        prev_dir = f"{base_dir}/{args.trained_epochs}_epochs"
+        prev_dir = f"{args.checkpoint_dir}/{args.language}/{args.encoder}/{args.loss_type}/{args.trained_epochs}_epochs"
         prev_ckpt_path = os.path.join(prev_dir, "detector.pth")
 
         if not os.path.exists(prev_ckpt_path):
@@ -347,35 +349,33 @@ if __name__ == '__main__':
     collate_fn = partial(my_collate, tokenizer=tokenizer, method=None, num_classes=2, args=args)
     criterion = hedgeLoss(alpha, temp, args.loss_type)
 
-    if args.do_train:
-        # training
-        train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True)
-        val_loader = data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True)
-        train_date = ''.join(str(datetime.now().date()).split("-"))
-        model = train(args, model, logger, train_loader, optimizer, criterion, device, valid_loader=val_loader, saved_dir=saved_dir, use_amp=use_amp, scaler=scaler)
+    # training
+    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True)
+    val_loader = data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True)
+    train_date = ''.join(str(datetime.now().date()).split("-"))
+    model = train(args, model, logger, train_loader, optimizer, criterion, device, valid_loader=val_loader, saved_dir=saved_dir, use_amp=use_amp, scaler=scaler)
 
-    if args.do_eval:
-        # evaluation
-        test_loader = data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
-        encoder.eval()
-        model.eval()
-        criterion.eval()
-        total_acc = 0
-        y_true = []
-        y_pred = []
-        with torch.no_grad():
-            for text, label in test_loader:
-                text = text.to(device)
-                label = label.to(device)
+    # evaluation
+    test_loader = data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    encoder.eval()
+    model.eval()
+    criterion.eval()
+    total_acc = 0
+    y_true = []
+    y_pred = []
+    with torch.no_grad():
+        for text, label in test_loader:
+            text = text.to(device)
+            label = label.to(device)
 
-                outputs = model(text)
-                logits = outputs['predicts']
-                y_true.append(label)
-                y_pred.append(torch.argmax(logits, -1))
-                preds = torch.argmax(logits, dim=1)
-                correct = (preds == label).sum().item()
-                total_acc += correct / label.size(0)
+            outputs = model(text)
+            logits = outputs['predicts']
+            y_true.append(label)
+            y_pred.append(torch.argmax(logits, -1))
+            preds = torch.argmax(logits, dim=1)
+            correct = (preds == label).sum().item()
+            total_acc += correct / label.size(0)
 
-        test_acc = total_acc / len(test_loader)
+    test_acc = total_acc / len(test_loader)
 
-        logger.info(f'Test accuracy: {test_acc:.4f}')
+    logger.info(f'Test accuracy: {test_acc:.4f}')
