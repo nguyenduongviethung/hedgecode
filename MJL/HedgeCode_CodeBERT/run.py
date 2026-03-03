@@ -92,7 +92,7 @@ def set_seed(seed=42):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-def train(args, model, logger, optimizer, valid_dataset, codebase_dataset, train_dataloader, valid_dataloader, codebase_dataloader, saved_dir, use_amp=True, scaler=None):
+def train(args, model, logger, optimizer, scheduler, valid_dataset, codebase_dataset, train_dataloader, valid_dataloader, codebase_dataloader, saved_dir, use_amp=True, scaler=None):
     total_epochs = args.trained_epochs + args.num_train_epochs
     best_mrr = 0.0
 
@@ -113,16 +113,19 @@ def train(args, model, logger, optimizer, valid_dataset, codebase_dataset, train
                 if loss.dim() > 0:
                     loss = loss.mean()
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             if args.device.type == "cuda":
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)   # quan trọng
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
+            scheduler.step()
 
             total_loss += loss.item()
 
@@ -147,12 +150,13 @@ def train(args, model, logger, optimizer, valid_dataset, codebase_dataset, train
         if results['eval_mrr'] > best_mrr:
             best_mrr = results['eval_mrr']
 
-    checkpoint_path = os.path.join(saved_dir, "detector.pth")
+    checkpoint_path = os.path.join(saved_dir, "model.pth")
 
     torch.save({
         'epoch': total_epochs,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
         'scaler_state_dict': scaler.state_dict() if scaler else None,
     }, checkpoint_path)
 
@@ -221,8 +225,10 @@ def main():
                         help="The output directory where the model predictions and checkpoints will be written.")
     parser.add_argument("--dataset_dir", default=None, type=str, required=True,
                         help="The input dataset directory which contains train.jsonl, valid.jsonl, test.jsonl and codebase.jsonl.")
-    parser.add_argument("--detector_dir", type=str, default=None,
+    parser.add_argument("--RA_checkpoint_dir", type=str, default=None,
                         help="Directory containing detector.pth")
+    parser.add_argument("--MJL_checkpoint_dir", type=str, default=None,
+                        help="Directory containing model.pth for resuming training")
     
     parser.add_argument("--nl_length", default=128, type=int,
                         help="Optional NL input sequence length after tokenization.")
@@ -257,6 +263,9 @@ def main():
                         choices=["codebert", "unixcoder", "cocosoda"])
     parser.add_argument("--trained_epochs", default=0, type=int,
                         help="Number of epochs already trained (for resuming).")
+    parser.add_argument("--RA_trained_epochs", default=0, type=int,
+                        help="Number of epochs already trained for RA (for resuming).")
+    parser.add_argument('--loss_type', type=str, default='ce', choices=['ce', 'hcl'], help="Loss function type.")
 
 
     # arguments
@@ -309,9 +318,8 @@ def main():
 
     # ========== BUILD MODEL FIRST ==========
     if args.trained_epochs > 0:
-
-        prev_dir = f"{base_dir}/{args.trained_epochs}_epochs"
-        prev_ckpt_path = os.path.join(prev_dir, "detector.pth")
+        prev_dir = f"{args.MJL_checkpoint_dir}/RA_{args.RA_trained_epochs}_epochs/{args.language}/{args.encoder}/{args.trained_epochs}_epochs"
+        prev_ckpt_path = os.path.join(prev_dir, "model.pth")
 
         if not os.path.exists(prev_ckpt_path):
             raise FileNotFoundError(f"Checkpoint not found at {prev_ckpt_path}")
@@ -323,35 +331,30 @@ def main():
         model.load_state_dict(checkpoint['model_state_dict'])
 
     else:
+        detector_dir = f"{args.RA_checkpoint_dir}/{args.language}/{args.encoder}/{args.loss_type}/{args.RA_trained_epochs}_epochs"
+        detector_path = os.path.join(detector_dir, "detector.pth")
 
-        if args.detector_dir is not None:
-            detector_path = os.path.join(args.detector_dir, "detector.pth")
-            logger.info(f"Loading detector from {detector_path}")
+        if not os.path.exists(detector_path):
+            raise FileNotFoundError(f"Detector checkpoint not found at {detector_path}")
+        logger.info(f"Loading detector from {detector_path}")
 
-            checkpoint = torch.load(detector_path, map_location=args.device)
+        checkpoint = torch.load(detector_path, map_location=args.device)
 
-            detector = HCLModel(
-                encoder,
-                args=args,
-                tokenizer=tokenizer,
-                hidden_size=hidden_size
-            ).to(args.device)
+        detector = HCLModel(
+            encoder,
+            args=args,
+            tokenizer=tokenizer,
+            hidden_size=hidden_size
+        ).to(args.device)
 
-            detector.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        detector.load_state_dict(checkpoint['model_state_dict'], strict=False)
 
-            encoder = detector.encoder
+        encoder = detector.encoder
 
         model = MJLModel(encoder, tokenizer, args).to(args.device)
 
     # ========== NOW BUILD OPTIMIZER ==========
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=0.01,
-        betas=(0.9, 0.99),
-        eps=1e-8,
-        amsgrad=True
-    )
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate, eps=1e-8)
 
     use_amp = args.device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=use_amp)
@@ -398,9 +401,20 @@ def main():
     codebase_sampler = SequentialSampler(codebase_dataset)
     codebase_dataloader = DataLoader(codebase_dataset, sampler=codebase_sampler, batch_size=args.eval_batch_size, num_workers=4)
 
+    total_steps = len(train_dataloader) * (args.trained_epochs + args.num_train_epochs)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(0.1 * total_steps),
+        num_training_steps=total_steps
+    )
+    
+    # ========== LOAD SCHEDULER STATE IF RESUME ==========
+    if args.trained_epochs > 0:
+        scheduler.load_state_dict(checkpoint.get('scheduler_state_dict', {}))
+
     # Training
     if args.do_train:
-        train(args, model, logger, optimizer, valid_dataset, codebase_dataset, train_dataloader, valid_dataloader, codebase_dataloader, saved_dir, use_amp, scaler)
+        train(args, model, logger, optimizer, scheduler, valid_dataset, codebase_dataset, train_dataloader, valid_dataloader, codebase_dataloader, saved_dir, use_amp, scaler)
 
     # Evaluation
     results = {}
