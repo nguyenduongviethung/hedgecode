@@ -105,7 +105,7 @@ class MJLModel(nn.Module):
 
         self.hidden_size = encoder.config.hidden_size
         self.batchsize = args.train_batch_size
-        self.K = args.train_batch_size * 5
+        self.K = args.train_batch_size * args.accumulation_steps * 5
 
         self.register_buffer("queue", torch.randn(self.hidden_size, self.K))
         self.queue = F.normalize(self.queue, dim=0)
@@ -201,18 +201,17 @@ class MJLModel(nn.Module):
                 augmented_code_inputs = augment_data(code_inputs, self.vocab_list, self.tokenizer).to(self.args.device)
                 augmented_nl_inputs = augment_data(nl_inputs,  self.vocab_list, self.tokenizer).to(self.args.device)
                 # get feature encodings
-                with torch.no_grad():
-                    aug_outputs = self.encoder(augmented_code_inputs, attention_mask=augmented_code_inputs.ne(self.pad_id))
-                    aug_code_vec = aug_outputs.last_hidden_state
-                    mask = augmented_code_inputs.ne(self.pad_id)
-                    denom = mask.sum(-1).clamp(min=1)[:, None]
-                    aug_code_vec = (aug_code_vec * mask[:, :, None]).sum(1) / denom
+                aug_outputs = self.encoder(augmented_code_inputs, attention_mask=augmented_code_inputs.ne(self.pad_id))
+                aug_code_vec = aug_outputs.last_hidden_state
+                mask = augmented_code_inputs.ne(self.pad_id)
+                denom = mask.sum(-1).clamp(min=1)[:, None]
+                aug_code_vec = (aug_code_vec * mask[:, :, None]).sum(1) / denom
 
-                    aug_outputs = self.encoder(augmented_nl_inputs, attention_mask=augmented_nl_inputs.ne(self.pad_id))
-                    aug_nl_vec = aug_outputs.last_hidden_state
-                    mask = augmented_nl_inputs.ne(self.pad_id)
-                    denom = mask.sum(-1).clamp(min=1)[:, None]
-                    aug_nl_vec = (aug_nl_vec * mask[:, :, None]).sum(1) / denom
+                aug_outputs = self.encoder(augmented_nl_inputs, attention_mask=augmented_nl_inputs.ne(self.pad_id))
+                aug_nl_vec = aug_outputs.last_hidden_state
+                mask = augmented_nl_inputs.ne(self.pad_id)
+                denom = mask.sum(-1).clamp(min=1)[:, None]
+                aug_nl_vec = (aug_nl_vec * mask[:, :, None]).sum(1) / denom
                 # compute self-supervised contrastive loss
                 contrastive_loss_code = self_supervised_contrastive_loss(code_vec, aug_code_vec)
                 contrastive_loss_nl = self_supervised_contrastive_loss(nl_vec, aug_nl_vec)

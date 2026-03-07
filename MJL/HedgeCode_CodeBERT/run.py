@@ -92,7 +92,10 @@ def set_seed(seed=42):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
-def train(args, model, logger, optimizer, scheduler, valid_dataset, codebase_dataset, train_dataloader, valid_dataloader, codebase_dataloader, saved_dir, use_amp=True, scaler=None):
+def train(args, model, logger, optimizer, scheduler, valid_dataset, codebase_dataset,
+          train_dataloader, valid_dataloader, codebase_dataloader,
+          saved_dir, use_amp=True, scaler=None):
+
     total_epochs = args.trained_epochs + args.num_train_epochs
     best_mrr = 0.0
 
@@ -100,7 +103,10 @@ def train(args, model, logger, optimizer, scheduler, valid_dataset, codebase_dat
         model.train()
         total_loss = 0
 
+        optimizer.zero_grad(set_to_none=True)
+
         for step, batch in enumerate(train_dataloader):
+
             code_inputs = batch[0].to(args.device)
             nl_inputs = batch[1].to(args.device)
 
@@ -113,27 +119,55 @@ def train(args, model, logger, optimizer, scheduler, valid_dataset, codebase_dat
                 if loss.dim() > 0:
                     loss = loss.mean()
 
-            optimizer.zero_grad(set_to_none=True)
+            loss = loss / args.accumulation_steps
 
             if args.device.type == "cuda":
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)   # quan trọng
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                optimizer.step()
-            scheduler.step()
 
-            total_loss += loss.item()
+            total_loss += loss.item() * args.accumulation_steps
+
+            if (step + 1) % args.accumulation_steps == 0:
+
+                if args.device.type == "cuda":
+                    scaler.unscale_(optimizer)
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+                if args.device.type == "cuda":
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
             if step % 500 == 0:
                 logger.info(
                     f"Epoch {epoch} - Step {step}/{len(train_dataloader)} "
-                    f"- Loss: {loss.item():.4f}"
+                    f"- Loss: {loss.item() * args.accumulation_steps:.4f} "
+                    f"- LR: {scheduler.get_last_lr()[0]:.6f}"
                 )
+
+        # --------- FIX: leftover gradients ----------
+        if (step + 1) % args.accumulation_steps != 0:
+
+            if args.device.type == "cuda":
+                scaler.unscale_(optimizer)
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+            if args.device.type == "cuda":
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+        # --------------------------------------------
 
         logger.info(
             f"Epoch {epoch} - Train loss: "
@@ -141,7 +175,9 @@ def train(args, model, logger, optimizer, scheduler, valid_dataset, codebase_dat
         )
 
         results = evaluate(
-            args, model, valid_dataset, codebase_dataset, valid_dataloader, codebase_dataloader,
+            args, model,
+            valid_dataset, codebase_dataset,
+            valid_dataloader, codebase_dataloader,
             eval_when_training=True
         )
 
@@ -250,6 +286,8 @@ def main():
                         help="The initial learning rate for Adam.")
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="Max gradient norm.")
+    parser.add_argument("--accumulation_steps", default=1, type=int,
+                        help="Number of updates steps to accumulate before performing a backward/update pass.")
 
     parser.add_argument('--seed', type=int, default=42,
                         help="random seed for initialization")
@@ -391,16 +429,16 @@ def main():
         random_indices = random.sample(all_indices, int(len(train_dataset) * 0.2))
         train_sampler = SubsetRandomSampler(random_indices)
 
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=4)
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size, num_workers=min(8, os.cpu_count()))
 
     valid_sampler = SequentialSampler(valid_dataset)
-    valid_dataloader = DataLoader(valid_dataset, sampler=valid_sampler, batch_size=args.eval_batch_size, num_workers=4)
+    valid_dataloader = DataLoader(valid_dataset, sampler=valid_sampler, batch_size=args.eval_batch_size, num_workers=min(8, os.cpu_count()))
 
     test_sampler = SequentialSampler(test_dataset)
-    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.eval_batch_size, num_workers=4)
+    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.eval_batch_size, num_workers=min(8, os.cpu_count()))
 
     codebase_sampler = SequentialSampler(codebase_dataset)
-    codebase_dataloader = DataLoader(codebase_dataset, sampler=codebase_sampler, batch_size=args.eval_batch_size, num_workers=4)
+    codebase_dataloader = DataLoader(codebase_dataset, sampler=codebase_sampler, batch_size=args.eval_batch_size, num_workers=min(8, os.cpu_count()))
 
     total_steps = len(train_dataloader) * args.total_epochs
     scheduler = get_linear_schedule_with_warmup(
